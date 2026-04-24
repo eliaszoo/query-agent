@@ -1,0 +1,8 @@
+anthropic
+mcp[cli]
+sqlparse
+aiomysql
+pyyaml
+hypothesis
+pytest
+pytest-asyncio

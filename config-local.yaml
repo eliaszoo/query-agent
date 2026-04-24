@@ -1,0 +1,55 @@
+# ============================================================
+# Agent 本地配置（连接远程 MCP Server）
+# 不需要数据库连接配置，数据库连接由远程 MCP Server 管理
+# ============================================================
+
+# Agent 配置
+agent:
+  default_cluster: "test"
+
+  # --- Claude (Anthropic) ---
+  # provider: "anthropic"
+  # model: "claude-sonnet-4-20250514"
+  # max_tokens: 4096
+  # api_key: "${ANTHROPIC_API_KEY}"
+
+  # --- DeepSeek ---
+  # provider: "openai_compatible"
+  # model: "deepseek-chat"
+  # max_tokens: 4096
+  # api_key: "${DEEPSEEK_API_KEY}"
+  # base_url: "https://api.deepseek.com"
+
+  # --- GPT (OpenAI) ---
+  # provider: "openai_compatible"
+  # model: "gpt-4o"
+  # max_tokens: 4096
+  # api_key: "${OPENAI_API_KEY}"
+  # base_url: "https://api.openai.com/v1"
+
+  # --- GLM (智谱) ---
+  # provider: "openai_compatible"
+  # model: "glm-4-plus"
+  # max_tokens: 4096
+  # api_key: "${ZHIPU_API_KEY}"
+  # base_url: "https://open.bigmodel.cn/api/paas/v4"
+
+  # --- Qwen (通义千问) ---
+  # provider: "openai_compatible"
+  # model: "qwen-plus"
+  # max_tokens: 4096
+  # api_key: "${DASHSCOPE_API_KEY}"
+  # base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# ============================================================
+# 多业务配置
+# 每个业务对应一个远程 MCP Server（SSE 模式）
+# ============================================================
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://mcp-host:8765/sse"
+  # 添加更多业务：
+  # order:
+  #   display_name: "订单"
+  #   mcp_server_url: "http://other-host:8765/sse"
