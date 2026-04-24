@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# Testing
+.pytest_cache/
+
+# Project-specific
+error_memory.json
+
+# claude
+.claude/

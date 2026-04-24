@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "query-agent"
+version = "0.1.0"
+description = "通用业务数据查询 Agent - 基于 LLM + MCP Server + MySQL 的智能查询系统"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "openai",
+    "mcp[cli]",
+    "sqlparse",
+    "aiomysql",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+query-agent = "src.main:main_entry"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "tests*"]

@@ -1,0 +1,5 @@
+# MCP Server 端依赖（部署在远程虚拟机上）
+mcp[cli]
+sqlparse
+aiomysql
+pyyaml
