@@ -9,15 +9,15 @@ clusters:
     description: "测试环境"
     host: "${DB_TEST_HOST}"        # 环境变量替换，启动前需 export DB_TEST_HOST=xxx
     port: 3306
-    database: "avatar-test2"
-    user: "readonly_user"
+    database: "${DB_TEST_DB}"
+    user: "${DB_TEST_USER}"
     password: "${DB_TEST_PASSWORD}"
   production:
     description: "生产环境"
     host: "${DB_PROD_HOST}"
     port: 3306
-    database: "avatar"
-    user: "readonly_user"
+    database: "${DB_PROD_DB}"
+    user: "${DB_PROD_USER}"
     password: "${DB_PROD_PASSWORD}"
 
 # SQL 安全策略
