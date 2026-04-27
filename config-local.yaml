@@ -48,7 +48,7 @@ agent:
 businesses:
   digitalhuman:
     display_name: "数字人"
-    mcp_server_url: "http://47.103.32.134:8765/sse"
+    mcp_server_url: "${MCP_SERVER_URL}"
     api_key: "${MCP_API_KEY}"  # 与 MCP Server 共享的鉴权密钥
   # 添加更多业务：
   # order:
