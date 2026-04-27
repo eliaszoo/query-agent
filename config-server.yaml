@@ -79,3 +79,7 @@ business_knowledge:
     - "tb_live.status: 1=编辑中, 2=审核中, 3=审核失败, 4=生成中, 5=生成失败, 6=待开播"
     - "tb_model.sex: 1=男, 2=女"
   custom_rules: []
+
+# 鉴权配置
+auth:
+  api_key: "${MCP_API_KEY}"  # Agent 连接时需携带此密钥，启动前需 export MCP_API_KEY=your-secret-key

@@ -13,6 +13,7 @@ from src.config import (
     AgentConfig,
     BusinessKnowledge,
     BusinessEntryConfig,
+    AuthConfig,
     load_config,
     _substitute_env_vars,
 )
@@ -240,6 +241,25 @@ businesses:
         finally:
             os.unlink(path)
 
+    def test_businesses_with_api_key(self):
+        yaml_content = """\
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+    api_key: "secret123"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            cfg = load_config(path)
+            assert cfg.businesses["digitalhuman"].api_key == "secret123"
+        finally:
+            os.unlink(path)
+
     def test_businesses_without_clusters_ok(self):
         """有 businesses 时，clusters 可以为空。"""
         yaml_content = """\
@@ -383,6 +403,78 @@ clusters:
         path = _write_yaml(yaml_content)
         try:
             with pytest.raises(ConfigError, match="未解析的环境变量"):
+                load_config(path)
+        finally:
+            os.unlink(path)
+
+
+class TestAuthConfig:
+    """测试鉴权配置。"""
+
+    def test_auth_api_key_from_config(self):
+        yaml_content = """\
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "user"
+    password: "pass"
+auth:
+  api_key: "my-secret-key"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            cfg = load_config(path)
+            assert cfg.auth.api_key == "my-secret-key"
+        finally:
+            os.unlink(path)
+
+    def test_auth_empty_by_default(self):
+        path = _write_yaml(MINIMAL_VALID_YAML)
+        try:
+            cfg = load_config(path)
+            assert cfg.auth.api_key == ""
+        finally:
+            os.unlink(path)
+
+    def test_auth_api_key_from_env_var(self, monkeypatch):
+        monkeypatch.setenv("MCP_API_KEY", "env-secret")
+        yaml_content = """\
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "user"
+    password: "pass"
+auth:
+  api_key: "${MCP_API_KEY}"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            cfg = load_config(path)
+            assert cfg.auth.api_key == "env-secret"
+        finally:
+            os.unlink(path)
+
+    def test_auth_invalid_type(self):
+        yaml_content = """\
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "user"
+    password: "pass"
+auth: "invalid"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            with pytest.raises(ConfigError, match="'auth' 配置格式无效"):
                 load_config(path)
         finally:
             os.unlink(path)

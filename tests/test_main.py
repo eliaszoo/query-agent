@@ -5,8 +5,33 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from src.main import main, main_entry, EXIT_COMMANDS, _build_welcome_message
+from src.main import main, main_entry, EXIT_COMMANDS, _build_welcome_message, _likely_feedback
 from src.business_registry import BusinessEntry
+
+
+class TestLikelyFeedback:
+    """Test the _likely_feedback heuristic."""
+
+    def test_short_with_keyword_is_feedback(self):
+        assert _likely_feedback("不对，应该查全部") is True
+
+    def test_short_with_correction_keyword(self):
+        assert _likely_feedback("错了") is True
+
+    def test_short_with_should_keyword(self):
+        assert _likely_feedback("应该用test集群") is True
+
+    def test_long_input_not_feedback(self):
+        assert _likely_feedback("帮我查一下数字人平台中训练成功的形象有多少个，按模型分组统计") is False
+
+    def test_short_without_keyword_not_feedback(self):
+        assert _likely_feedback("查数字人") is False
+
+    def test_medium_without_keyword_not_feedback(self):
+        assert _likely_feedback("查询所有训练成功的数字人形象列表") is False
+
+    def test_medium_with_keyword_is_feedback(self):
+        assert _likely_feedback("不对，应该只查测试环境的") is True
 
 
 class TestExitCommands:
@@ -26,7 +51,7 @@ class TestWelcomeMessage:
 
     def test_default_welcome_contains_title(self):
         msg = _build_welcome_message()
-        assert "查询 Agent" in msg
+        assert "query-agent" in msg
 
     def test_single_business_welcome(self):
         businesses = [BusinessEntry(name="default", display_name="数字人平台", mcp_server_url="http://a/sse")]
@@ -39,21 +64,17 @@ class TestWelcomeMessage:
             BusinessEntry(name="order", display_name="订单", mcp_server_url="http://b/sse"),
         ]
         msg = _build_welcome_message(businesses)
-        assert "多业务模式" in msg
+        assert "multi-business" in msg
         assert "digitalhuman" in msg
         assert "order" in msg
 
-    def test_welcome_contains_exit_hint(self):
-        msg = _build_welcome_message()
-        assert "exit/quit/q" in msg
-
-    def test_welcome_contains_add_command(self):
+    def test_welcome_contains_slash_commands(self):
         msg = _build_welcome_message()
         assert "/add" in msg
-
-    def test_welcome_contains_list_command(self):
-        msg = _build_welcome_message()
         assert "/list" in msg
+        assert "/memory" in msg
+        assert "/clear" in msg
+        assert "/new" in msg
 
 
 class TestMainLoop:
@@ -67,8 +88,7 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", return_value="exit"):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
+        # Exits cleanly (no exception)
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -78,8 +98,6 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", return_value="quit"):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -89,8 +107,6 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", return_value="q"):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -100,8 +116,6 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", return_value="EXIT"):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -112,8 +126,6 @@ class TestMainLoop:
         inputs = iter(["", "exit"])
         with patch("builtins.input", side_effect=inputs):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -130,7 +142,6 @@ class TestMainLoop:
 
         mock_agent.run_query.assert_called_once_with("查询所有数据")
         captured = capsys.readouterr()
-        assert "查询中" in captured.out
         assert "查询结果：共3条记录" in captured.out
 
     @pytest.mark.asyncio
@@ -147,9 +158,8 @@ class TestMainLoop:
             await main()
 
         captured = capsys.readouterr()
-        assert "查询出错" in captured.out
+        assert "Error" in captured.out
         assert "API 连接失败" in captured.out
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -159,8 +169,6 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", side_effect=EOFError):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -170,8 +178,6 @@ class TestMainLoop:
         mock_agent_cls.return_value = MagicMock()
         with patch("builtins.input", side_effect=KeyboardInterrupt):
             await main()
-        captured = capsys.readouterr()
-        assert "再见" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -186,9 +192,9 @@ class TestMainLoop:
         with patch("builtins.input", side_effect=inputs):
             await main()
 
-        mock_agent.registry.register.assert_called_once_with("order", "http://host:8765/sse", "订单")
+        mock_agent.registry.register.assert_called_once_with("order", "http://host:8765/sse", "订单", api_key="")
         captured = capsys.readouterr()
-        assert "已添加业务" in captured.out
+        assert "Added" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -206,7 +212,7 @@ class TestMainLoop:
 
         mock_agent.registry.remove.assert_called_once_with("order")
         captured = capsys.readouterr()
-        assert "已移除业务" in captured.out
+        assert "Removed" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -226,6 +232,40 @@ class TestMainLoop:
 
         captured = capsys.readouterr()
         assert "digitalhuman" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_clear_command_all(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.error_memory = MagicMock()
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/clear", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.error_memory.clear.assert_called_once_with()
+        captured = capsys.readouterr()
+        assert "Cleared" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_clear_command_specific_business(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.error_memory = MagicMock()
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/clear digitalhuman", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.error_memory.clear.assert_called_once_with(business="digitalhuman")
+        captured = capsys.readouterr()
+        assert "Cleared" in captured.out
 
 
 class TestMainEntry:

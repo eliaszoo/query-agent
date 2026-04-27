@@ -28,6 +28,7 @@ class BusinessEntry:
     name: str  # 业务标识，如 "digitalhuman"
     display_name: str  # 显示名，如 "数字人"
     mcp_server_url: str  # SSE URL
+    api_key: str = ""  # MCP Server 鉴权密钥
     knowledge: Optional[BusinessKnowledge] = None  # 从 MCP server 获取的业务知识
     _connected: bool = field(default=False, repr=False, init=False)
 
@@ -44,19 +45,22 @@ class BusinessRegistry:
 
     def __init__(self) -> None:
         self._entries: dict[str, BusinessEntry] = {}
+        self._session_cache: dict[str, tuple[ClientSession, Any]] = {}  # name → (session, ctx)
 
-    def register(self, name: str, mcp_server_url: str, display_name: str = "") -> None:
+    def register(self, name: str, mcp_server_url: str, display_name: str = "", api_key: str = "") -> None:
         """注册一个业务（不立即连接）。
 
         Args:
             name: 业务标识。
             mcp_server_url: MCP Server 的 SSE URL。
             display_name: 显示名称。
+            api_key: MCP Server 鉴权密钥。
         """
         self._entries[name] = BusinessEntry(
             name=name,
             display_name=display_name or name,
             mcp_server_url=mcp_server_url,
+            api_key=api_key,
         )
         logger.info("已注册业务: %s (%s) -> %s", name, display_name, mcp_server_url)
 
@@ -106,14 +110,62 @@ class BusinessRegistry:
             已初始化的 ClientSession。
         """
         entry = self.get_entry(name)
-        async with sse_client(entry.mcp_server_url) as (read_stream, write_stream):
+        headers = {}
+        if entry.api_key:
+            headers["Authorization"] = f"Bearer {entry.api_key}"
+        async with sse_client(entry.mcp_server_url, headers=headers or None) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 entry._connected = True
                 yield session
 
+    @asynccontextmanager
+    async def get_cached_session(self, name: str) -> AsyncIterator[ClientSession]:
+        """获取缓存的 session，同一业务复用连接，异常时自动清除缓存并重连。"""
+        if name in self._session_cache:
+            session, _ = self._session_cache[name]
+            try:
+                yield session
+                return
+            except Exception:
+                # 连接异常时清除缓存，下面会重建
+                await self._close_cached_session(name)
+
+        entry = self.get_entry(name)
+        headers = {}
+        if entry.api_key:
+            headers["Authorization"] = f"Bearer {entry.api_key}"
+
+        ctx = sse_client(entry.mcp_server_url, headers=headers or None)
+        read_stream, write_stream = await ctx.__aenter__()
+        session = ClientSession(read_stream, write_stream)
+        await session.__aenter__()
+        await session.initialize()
+        entry._connected = True
+
+        self._session_cache[name] = (session, ctx)
+        try:
+            yield session
+        except Exception:
+            await self._close_cached_session(name)
+            raise
+
+    async def _close_cached_session(self, name: str) -> None:
+        """关闭并清除指定业务的缓存 session。"""
+        if name not in self._session_cache:
+            return
+        session, ctx = self._session_cache.pop(name)
+        try:
+            await session.__aexit__(None, None, None)
+        except Exception:
+            logger.warning("关闭 session 失败: %s", name, exc_info=True)
+        try:
+            await ctx.__aexit__(None, None, None)
+        except Exception:
+            logger.warning("关闭 SSE context 失败: %s", name, exc_info=True)
+
     async def call_tool(self, name: str, tool_name: str, arguments: dict) -> str:
-        """在指定业务上调用 MCP 工具。
+        """在指定业务上调用 MCP 工具（复用缓存的 SSE 连接）。
 
         Args:
             name: 业务标识。
@@ -123,7 +175,7 @@ class BusinessRegistry:
         Returns:
             工具结果的 JSON 字符串。
         """
-        async with self.get_session(name) as session:
+        async with self.get_cached_session(name) as session:
             result = await session.call_tool(tool_name, arguments)
             return self._serialize_tool_result(result)
 
@@ -172,7 +224,7 @@ class BusinessRegistry:
                 logger.warning("获取业务 '%s' 知识失败，跳过", name, exc_info=True)
 
     async def fetch_tools_schema(self, name: str) -> list[dict]:
-        """从 MCP Server 获取工具列表。
+        """从 MCP Server 获取工具列表（复用缓存的 SSE 连接）。
 
         Args:
             name: 业务标识。
@@ -180,7 +232,7 @@ class BusinessRegistry:
         Returns:
             工具定义列表。
         """
-        async with self.get_session(name) as session:
+        async with self.get_cached_session(name) as session:
             tools_result = await session.list_tools()
             tools = []
             for tool in tools_result.tools:
@@ -192,7 +244,9 @@ class BusinessRegistry:
             return tools
 
     async def close_all(self) -> None:
-        """关闭所有连接并清空注册。"""
+        """关闭所有缓存的 session 并清空注册。"""
+        for name in list(self._session_cache.keys()):
+            await self._close_cached_session(name)
         self._entries.clear()
 
     @staticmethod

@@ -80,6 +80,10 @@ business_knowledge:
     - "tb_model.sex: 1=男, 2=女"
   custom_rules: []
 
+# 鉴权配置（本地 stdio 模式不需要鉴权，此处为示例）
+auth:
+  api_key: ""  # 设为 "${MCP_API_KEY}" 启用鉴权
+
 # Agent 配置
 agent:
   provider: "anthropic"                # "anthropic" 或 "openai_compatible"

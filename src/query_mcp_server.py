@@ -4,8 +4,11 @@
 所有工具返回统一的结构化结果，错误时返回 {success, error_type, error_message}。
 """
 
+import asyncio
 import logging
 import os
+import re
+import secrets
 
 from mcp.server.fastmcp import FastMCP
 
@@ -14,6 +17,69 @@ from src.sql_validator import SQLValidator
 from src.db_pool import ConnectionPoolManager
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 鉴权中间件
+# ---------------------------------------------------------------------------
+
+
+class BearerAuthMiddleware:
+    """Starlette ASGI 中间件，校验 Bearer Token。
+
+    对所有 HTTP 请求校验 Authorization: Bearer <api_key>，
+    不匹配则返回 401/403。非 HTTP 请求直接放行。
+    """
+
+    def __init__(self, app, api_key: str):
+        self.app = app
+        self.api_key = api_key
+
+    async def __call__(self, scope, receive, send):
+        # 对 HTTP 和 WebSocket 都做鉴权
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.responses import Response
+
+        headers = dict(scope.get("headers", []))
+        auth_header = headers.get(b"authorization", b"").decode("utf-8")
+
+        if not auth_header.startswith("Bearer "):
+            if scope["type"] == "http":
+                response = Response(
+                    "Unauthorized",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+            else:
+                await send({"type": "websocket.close", "code": 4001})
+            return
+
+        token = auth_header[7:]  # Strip "Bearer "
+        if not secrets.compare_digest(token, self.api_key):
+            if scope["type"] == "http":
+                response = Response("Forbidden", status_code=403)
+                await response(scope, receive, send)
+            else:
+                await send({"type": "websocket.close", "code": 4003})
+            return
+
+        await self.app(scope, receive, send)
+
+
+def _get_api_key() -> str:
+    """获取 API Key，优先从配置文件 auth.api_key，其次从环境变量 MCP_API_KEY。"""
+    try:
+        config_path = os.environ.get("CONFIG_PATH", "./config.yaml")
+        config = load_config(config_path)
+        if config.auth.api_key:
+            return config.auth.api_key
+    except Exception:
+        pass
+    return os.environ.get("MCP_API_KEY", "")
+
 
 # ---------------------------------------------------------------------------
 # Server & shared state
@@ -28,6 +94,15 @@ mcp = FastMCP(
 _config: AppConfig | None = None
 _pool_manager: ConnectionPoolManager | None = None
 _validator: SQLValidator | None = None
+_init_lock = asyncio.Lock()
+
+# 表名合法字符正则：纵深防御，防止反引号逃逸等 SQL 注入
+_TABLE_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+
+def _validate_table_name(table_name: str) -> bool:
+    """校验表名只包含合法字符，防止 SQL 注入。"""
+    return bool(_TABLE_NAME_PATTERN.match(table_name))
 
 
 def _error_response(error_type: str, error_message: str) -> dict:
@@ -40,18 +115,25 @@ def _error_response(error_type: str, error_message: str) -> dict:
 
 
 async def _ensure_initialized() -> tuple[AppConfig, ConnectionPoolManager, SQLValidator]:
-    """确保配置、连接池和验证器已初始化，返回 (config, pool_manager, validator)。"""
+    """确保配置、连接池和验证器已初始化，返回 (config, pool_manager, validator)。
+
+    使用 double-check locking 防止并发重复初始化。
+    """
     global _config, _pool_manager, _validator
 
-    if _config is None:
+    # 快速路径：已初始化直接返回
+    if _config is not None and _pool_manager is not None and _validator is not None:
+        return _config, _pool_manager, _validator
+
+    async with _init_lock:
+        # double-check
+        if _config is not None and _pool_manager is not None and _validator is not None:
+            return _config, _pool_manager, _validator
+
         config_path = os.environ.get("CONFIG_PATH", "./config.yaml")
         _config = load_config(config_path)
-
-    if _pool_manager is None:
         _pool_manager = ConnectionPoolManager(_config.clusters)
         await _pool_manager.initialize()
-
-    if _validator is None:
         _validator = SQLValidator(allowed_tables=_config.sql_security.allowed_tables)
 
     return _config, _pool_manager, _validator
@@ -68,17 +150,7 @@ async def execute_readonly_sql(
     sql: str,
     max_rows: int = 100,
 ) -> dict:
-    """在指定集群上执行只读 SQL 查询。
-
-    Args:
-        cluster: 集群名称，如 "test", "production"。
-        sql: 要执行的 SQL 查询语句。
-        max_rows: 最大返回行数，默认 100。
-
-    Returns:
-        成功: {"success": true, "columns": [...], "rows": [...], "row_count": N, "truncated": bool}
-        失败: {"success": false, "error_type": "...", "error_message": "..."}
-    """
+    """在指定集群上执行只读 SQL 查询。"""
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:
@@ -113,6 +185,10 @@ async def execute_readonly_sql(
     try:
         async with pool_manager.get_connection(cluster) as conn:
             async with conn.cursor() as cur:
+                # 设置查询超时（MySQL 5.7.8+，仅对 SELECT 生效）
+                timeout_ms = config.sql_security.query_timeout * 1000
+                await cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {timeout_ms}")
+
                 await cur.execute(safe_sql)
                 columns = [desc[0] for desc in cur.description] if cur.description else []
                 rows = await cur.fetchall()
@@ -129,16 +205,18 @@ async def execute_readonly_sql(
                     "truncated": truncated,
                 }
     except Exception as exc:
+        error_msg = str(exc)
+        if "MAX_EXECUTION_TIME" in error_msg or "Query execution was interrupted" in error_msg:
+            return _error_response(
+                "TIMEOUT_ERROR",
+                f"查询超时（{config.sql_security.query_timeout}s），请优化查询条件",
+            )
         return _error_response("QUERY_ERROR", f"查询执行失败: {exc}")
 
 
 @mcp.tool()
 async def get_cluster_list() -> dict:
-    """获取所有已配置的数据库集群列表。
-
-    Returns:
-        {"clusters": [{"name": "...", "description": "...", "database": "...", "status": "..."}]}
-    """
+    """获取所有已配置的数据库集群列表。"""
     try:
         config, pool_manager, _ = await _ensure_initialized()
     except Exception as exc:
@@ -161,19 +239,7 @@ async def get_table_schema(
     cluster: str,
     table_name: str | None = None,
 ) -> dict:
-    """获取指定集群的表结构信息。
-
-    当 table_name 为空时，返回所有允许查询的业务表列表。
-    当指定 table_name 时，执行 SHOW COLUMNS FROM table_name 返回表的详细 schema。
-
-    Args:
-        cluster: 集群名称。
-        table_name: 表名，为空则返回所有表列表。
-
-    Returns:
-        表列表: {"tables": ["..."]}
-        表详情: {"table_name": "...", "columns": [{"name": "...", "type": "...", ...}]}
-    """
+    """获取表结构。不指定 table_name 则返回所有允许查询的表列表。"""
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:
@@ -196,6 +262,10 @@ async def get_table_schema(
     # 无 table_name → 返回白名单表列表
     if table_name is None:
         return {"tables": list(validator._allowed_tables)}
+
+    # 校验表名合法性（纵深防御，防止 SQL 注入）
+    if not _validate_table_name(table_name):
+        return _error_response("INVALID_INPUT", f"非法表名: {table_name}")
 
     # 验证 table_name 在白名单中
     allowed_set = set(validator._allowed_tables)
@@ -236,18 +306,7 @@ async def get_table_indexes(
     cluster: str,
     table_name: str | None = None,
 ) -> dict:
-    """获取表的索引信息。
-
-    当 table_name 为空时，返回所有白名单表的索引信息。
-    当指定 table_name 时，返回该表的索引详情。
-
-    Args:
-        cluster: 集群名称。
-        table_name: 表名，为空则返回所有白名单表的索引信息。
-
-    Returns:
-        {"indexes": [{"table": "...", "name": "...", "columns": [...], "unique": bool, "type": "..."}]}
-    """
+    """获取表的索引信息。不指定 table_name 则返回所有白名单表的索引。"""
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:
@@ -269,6 +328,8 @@ async def get_table_indexes(
 
     # 确定要查询的表列表
     if table_name:
+        if not _validate_table_name(table_name):
+            return _error_response("INVALID_INPUT", f"非法表名: {table_name}")
         tables_to_query = [table_name]
     else:
         tables_to_query = list(validator._allowed_tables)
@@ -325,14 +386,7 @@ async def get_table_indexes(
 
 @mcp.tool()
 async def get_business_knowledge() -> dict:
-    """获取当前配置的业务领域知识。
-
-    Agent 在首次连接时调用此工具获取业务术语映射、表关系、状态码等知识，
-    补充到 system prompt 中，无需在 agent 侧硬编码业务知识。
-
-    Returns:
-        {"description": "...", "term_mappings": {...}, "table_relationships": [...], "status_codes": [...], "custom_rules": [...]}
-    """
+    """获取当前配置的业务领域知识。"""
     try:
         config, _, _ = await _ensure_initialized()
     except Exception as exc:
@@ -357,6 +411,8 @@ async def get_business_knowledge() -> dict:
 
 if __name__ == "__main__":
     import argparse
+    import anyio
+    import uvicorn
 
     parser = argparse.ArgumentParser(description="查询 MCP Server")
     parser.add_argument(
@@ -372,4 +428,25 @@ if __name__ == "__main__":
     if args.config:
         os.environ["CONFIG_PATH"] = args.config
 
-    mcp.run(transport=args.transport)
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    elif args.transport == "sse":
+        # 构建带鉴权的 Starlette app
+        app = mcp.sse_app()
+        api_key = _get_api_key()
+        if api_key:
+            app = BearerAuthMiddleware(app, api_key)
+            logger.info("SSE server: API Key authentication enabled")
+        else:
+            logger.warning("SSE server: No API Key configured, authentication disabled")
+
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8765"))
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+        )
+        server = uvicorn.Server(config)
+        anyio.run(server.serve)

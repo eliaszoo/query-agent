@@ -24,6 +24,18 @@ class TestRegister:
         registry.register("order", "http://host:8765/sse")
         assert registry.list_businesses()[0].display_name == "order"
 
+    def test_register_with_api_key(self):
+        registry = BusinessRegistry()
+        registry.register("digitalhuman", "http://host:8765/sse", "数字人", api_key="secret123")
+        entry = registry.get_entry("digitalhuman")
+        assert entry.api_key == "secret123"
+
+    def test_register_no_api_key_default_empty(self):
+        registry = BusinessRegistry()
+        registry.register("digitalhuman", "http://host:8765/sse")
+        entry = registry.get_entry("digitalhuman")
+        assert entry.api_key == ""
+
 
 class TestRemove:
     @pytest.mark.asyncio

@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_PATH = "./error_memory.json"
 MAX_MEMORY_ENTRIES = 50  # 最多保留的错误记录数
+MAX_MEMORY_TOKENS = 500  # 错误记忆的 token 预算
+CHARS_PER_TOKEN = 1.5    # 中文粗略估算：1 字 ≈ 1.5 token
 
 
 @dataclass
@@ -23,7 +25,8 @@ class ErrorEntry:
 
     timestamp: str
     user_query: str
-    error_type: str  # "SQL_REJECTED", "QUERY_FAILED", "USER_CORRECTION", "WRONG_TABLE"
+    error_type: str  # "SQL_REJECTED", "QUERY_FAILED", "USER_CORRECTION", "USER_FEEDBACK", "WRONG_TABLE"
+    business: str = ""  # 关联的业务标识（空字符串表示通用经验）
     bad_sql: Optional[str] = None
     error_message: Optional[str] = None
     corrected_sql: Optional[str] = None
@@ -58,25 +61,36 @@ class ErrorMemoryManager:
             return ErrorMemory()
 
     def _save(self) -> None:
-        """持久化错误记忆到文件。"""
+        """持久化错误记忆到文件（原子写入，避免并发写冲突）。"""
         data = {"entries": [asdict(e) for e in self._memory.entries]}
-        with open(self._path, "w", encoding="utf-8") as f:
+        tmp_path = self._path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self._path)  # 原子替换，跨平台安全
 
     def add_error(
         self,
         user_query: str,
         error_type: str,
+        business: str = "",
         bad_sql: Optional[str] = None,
         error_message: Optional[str] = None,
         corrected_sql: Optional[str] = None,
         lesson: str = "",
     ) -> None:
-        """记录一条错误。"""
+        """记录一条错误（自动去重）。"""
+        # 去重：相同 business + lesson 的经验不重复记录
+        if lesson:
+            for existing in self._memory.entries:
+                if existing.business == business and existing.lesson == lesson:
+                    logger.debug("经验已存在，跳过: %s", lesson)
+                    return
+
         entry = ErrorEntry(
             timestamp=datetime.now().isoformat(),
             user_query=user_query,
             error_type=error_type,
+            business=business,
             bad_sql=bad_sql,
             error_message=error_message,
             corrected_sql=corrected_sql,
@@ -94,33 +108,63 @@ class ErrorMemoryManager:
         """获取所有错误记录。"""
         return list(self._memory.entries)
 
-    def build_memory_prompt(self) -> str:
+    def build_memory_prompt(self, current_business: str = "") -> str:
         """将错误记忆转换为可注入 System Prompt 的文本。
 
-        只取最近的记录，按错误类型分组，生成简洁的经验总结。
+        只注入经验教训（lesson），不注入原始查询和 SQL，减少 token 消耗。
+        按 token 预算控制总量，从最新的经验开始倒序填充。
+
+        Args:
+            current_business: 当前查询的业务标识，为空则返回全部经验。
         """
         entries = self._memory.entries
         if not entries:
             return ""
 
-        lines = ["\n## 历史错误经验（请务必避免重复犯错）\n"]
+        # 过滤业务：只保留通用经验（business 为空）和当前业务的经验
+        if current_business:
+            entries = [e for e in entries if not e.business or e.business == current_business]
 
-        for i, entry in enumerate(entries[-20:], 1):  # 最多注入最近 20 条
-            lines.append(f"### 经验 {i}")
-            lines.append(f"- 用户查询: {entry.user_query}")
-            if entry.bad_sql:
-                lines.append(f"- 错误 SQL: `{entry.bad_sql}`")
-            if entry.error_message:
-                lines.append(f"- 错误原因: {entry.error_message}")
-            if entry.corrected_sql:
-                lines.append(f"- 正确 SQL: `{entry.corrected_sql}`")
-            if entry.lesson:
-                lines.append(f"- 教训: {entry.lesson}")
-            lines.append("")
+        # 只注入有 lesson 的条目
+        lessons = [e for e in entries if e.lesson]
+        if not lessons:
+            return ""
 
+        budget_chars = int(MAX_MEMORY_TOKENS * CHARS_PER_TOKEN)
+        lines = ["\n## 历史经验（请避免重复犯错）\n"]
+        total_chars = 0
+
+        # 从最新的开始，倒序填充
+        for entry in reversed(lessons):
+            prefix = f"[{entry.business}] " if entry.business else ""
+            line = f"- {prefix}{entry.lesson}"
+
+            if total_chars + len(line) > budget_chars:
+                break
+            lines.append(line)
+            total_chars += len(line)
+
+        if len(lines) <= 1:
+            return ""
+
+        # 恢复正序（最早在前）
+        lines = [lines[0]] + list(reversed(lines[1:]))
         return "\n".join(lines)
 
-    def clear(self) -> None:
-        """清空所有错误记忆。"""
-        self._memory = ErrorMemory()
+    def clear(self, business: str = "") -> None:
+        """清空错误记忆。
+
+        Args:
+            business: 指定业务则只清除该业务的记忆，为空则清空全部。
+        """
+        if not business:
+            self._memory = ErrorMemory()
+        else:
+            self._memory.entries = [
+                e for e in self._memory.entries if e.business != business
+            ]
         self._save()
+
+    def get_businesses(self) -> list[str]:
+        """获取所有有错误记忆的业务标识列表（去重）。"""
+        return list(dict.fromkeys(e.business for e in self._memory.entries if e.business))

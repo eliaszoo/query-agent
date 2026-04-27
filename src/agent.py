@@ -11,7 +11,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
@@ -26,8 +26,25 @@ from src.sql_risk_checker import SQLRiskChecker, IndexInfo
 
 logger = logging.getLogger(__name__)
 
-# 最多保留的历史消息轮数（用户+助手各算一轮）
-MAX_HISTORY_TURNS = 10
+# 完整保留的最近轮数
+RECENT_TURNS_KEEP = 3
+# 压缩保留的最大轮数（超出直接丢弃）
+MAX_COMPRESSED_TURNS = 5
+
+
+def _sanitize_args_for_log(args: dict) -> dict:
+    """脱敏工具参数，用于日志输出。"""
+    if not isinstance(args, dict):
+        return args
+    sanitized = {}
+    for k, v in args.items():
+        if k in ("password", "api_key", "token", "secret"):
+            sanitized[k] = "***"
+        elif k == "sql" and isinstance(v, str) and len(v) > 200:
+            sanitized[k] = v[:200] + "..."
+        else:
+            sanitized[k] = v
+    return sanitized
 
 
 @dataclass
@@ -145,10 +162,18 @@ class QueryAgent:
 
         # 多轮对话历史
         self._conversation_history: list[dict] = []
+        self._pinned_messages: list[dict] = []
 
         # SQL 性能风险检测器
         self._risk_checker = SQLRiskChecker()
         self._indexes_loaded = False
+
+        # System prompt 缓存
+        self._cached_system_prompt: str = ""
+        self._prompt_dirty: bool = True
+
+        # 最近查询上下文（用于反馈检测）
+        self._last_query_context: dict | None = None  # {"business", "query", "response", "sql"}
 
         # 用户确认回调（默认用 input，测试时可以注入 mock）
         self._confirm_callback = confirm_callback or self._default_confirm
@@ -158,7 +183,7 @@ class QueryAgent:
 
         # 从配置加载初始业务列表
         for name, entry_cfg in self.config.businesses.items():
-            self.registry.register(name, entry_cfg.mcp_server_url, entry_cfg.display_name)
+            self.registry.register(name, entry_cfg.mcp_server_url, entry_cfg.display_name, api_key=entry_cfg.api_key)
 
         # 本地 MCP Server 子进程启动参数（stdio 模式，仅当无远程 URL 时使用）
         self.mcp_server_params = StdioServerParameters(
@@ -174,7 +199,10 @@ class QueryAgent:
         self._is_stdio_mode = not self.config.businesses and not self.config.agent.mcp_server_url
 
     def _build_system_prompt(self) -> str:
-        """构建包含多业务知识和错误记忆的动态 System Prompt。"""
+        """构建包含多业务知识和错误记忆的动态 System Prompt（带缓存）。"""
+        if not self._prompt_dirty and self._cached_system_prompt:
+            return self._cached_system_prompt
+
         businesses = self.registry.list_businesses()
         knowledge_map: dict[str, BusinessKnowledge] = {}
 
@@ -187,19 +215,98 @@ class QueryAgent:
             knowledge_map["default"] = self._business_knowledge
 
         prompt = build_system_prompt(businesses, knowledge_map)
-        memory_prompt = self.error_memory.build_memory_prompt()
+
+        # 错误记忆：单业务模式按业务过滤，多业务模式注入全部
+        current_business = ""
+        if self._is_stdio_mode:
+            current_business = "default"
+        memory_prompt = self.error_memory.build_memory_prompt(current_business)
         if memory_prompt:
             prompt += memory_prompt
+
+        self._cached_system_prompt = prompt
+        self._prompt_dirty = False
         return prompt
 
+    def _mark_prompt_dirty(self) -> None:
+        """标记 system prompt 需要重建（在知识或记忆变化时调用）。"""
+        self._prompt_dirty = True
+
     def clear_history(self) -> None:
-        """清空对话历史。"""
+        """清空对话历史（保留置顶消息）。"""
         self._conversation_history.clear()
 
+    def pin_message(self, content: str) -> None:
+        """置顶一条重要上下文消息，压缩时不会被截断。"""
+        self._pinned_messages.append({"role": "user", "content": f"[置顶] {content}"})
+
     def _trim_history(self) -> None:
-        """修剪对话历史，保留最近 N 轮。"""
-        if len(self._conversation_history) > MAX_HISTORY_TURNS * 2:
-            self._conversation_history = self._conversation_history[-(MAX_HISTORY_TURNS * 2):]
+        """修剪对话历史，保留最近 N 轮，早期轮次压缩为摘要。
+
+        最近 RECENT_TURNS_KEEP 轮保留完整内容，更早的轮次只保留
+        用户消息和 assistant 文本摘要，去掉工具调用详情和工具结果。
+        置顶消息始终保留在最前面。
+        """
+        recent_count = RECENT_TURNS_KEEP * 2
+
+        if len(self._conversation_history) <= recent_count:
+            # 即使不压缩，也要确保置顶消息在前面
+            self._prepend_pinned()
+            return
+
+        # 超过最大上限，先截断
+        max_total = (RECENT_TURNS_KEEP + MAX_COMPRESSED_TURNS) * 2
+        if len(self._conversation_history) > max_total:
+            self._conversation_history = self._conversation_history[-max_total:]
+
+        # 保留最近 RECENT_TURNS_KEEP 轮完整，更早的压缩
+        if len(self._conversation_history) <= recent_count:
+            self._prepend_pinned()
+            return
+
+        recent = self._conversation_history[-recent_count:]
+        older = self._conversation_history[:-recent_count]
+
+        compressed = []
+        for msg in older:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "assistant":
+                text = self._extract_text_from_content(content)
+                if text:
+                    compressed.append({"role": "assistant", "content": f"[历史] {text[:200]}"})
+            elif role == "user" and isinstance(content, str):
+                compressed.append({"role": "user", "content": content})
+            # 跳过 tool result 消息和 tool_calls 格式的 assistant 消息
+
+        self._conversation_history = compressed + recent
+        self._prepend_pinned()
+
+    def _prepend_pinned(self) -> None:
+        """将置顶消息插入对话历史最前面（去重）。"""
+        if not self._pinned_messages:
+            return
+        # 移除已有的置顶消息，再重新插入
+        self._conversation_history = [
+            m for m in self._conversation_history
+            if not (isinstance(m.get("content"), str) and m["content"].startswith("[置顶] "))
+        ]
+        self._conversation_history = self._pinned_messages + self._conversation_history
+
+    @staticmethod
+    def _extract_text_from_content(content) -> str:
+        """从 assistant content 中提取纯文本（兼容 Anthropic 和 OpenAI 格式）。"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Anthropic 格式：content 是 block 列表
+            texts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+            return "\n".join(texts)
+        return ""
 
     async def _ensure_knowledge_loaded(self) -> None:
         """确保所有已注册业务的领域知识已加载（用于构建 system prompt）。"""
@@ -207,6 +314,7 @@ class QueryAgent:
             if entry.knowledge is None:
                 try:
                     await self.registry.fetch_business_knowledge(entry.name)
+                    self._mark_prompt_dirty()
                 except Exception:
                     logger.warning("获取业务 '%s' 知识失败，跳过", entry.name, exc_info=True)
 
@@ -272,10 +380,17 @@ class QueryAgent:
                 tools_result = await session.list_tools()
                 tools = _convert_mcp_tools_to_anthropic(tools_result.tools)
                 await self._try_fetch_business_knowledge(session)
-                result = await self._conversation_loop(
-                    session, tools, user_input, metrics
+
+                # stdio 模式：确保索引在对话开始前加载（需要 session）
+                await self._ensure_indexes_loaded_stdio(session)
+
+                async def execute_tool(name: str, args: dict, _business: str) -> tuple[str, str]:
+                    result = await session.call_tool(name, args)
+                    return self._serialize_tool_result(result), "default"
+
+                return await self._conversation_loop_core(
+                    tools, user_input, metrics, system_prompt=None, execute_tool=execute_tool,
                 )
-        return result
 
     async def _run_query_multi_business(
         self, user_input: str, metrics: QueryMetrics
@@ -326,30 +441,40 @@ class QueryAgent:
         except Exception:
             logger.debug("从 MCP Server 获取业务知识失败，使用本地配置", exc_info=True)
 
-    async def _ensure_indexes_loaded(self, session: ClientSession | None = None) -> None:
-        """确保索引信息已加载到风险检测器中。
-
-        Args:
-            session: stdio 模式下的 MCP session（多业务模式不需要）。
-        """
+    async def _ensure_indexes_loaded(self) -> None:
+        """确保索引信息已加载到风险检测器中（多业务 SSE 模式）。"""
         if self._indexes_loaded:
             return
 
-        if self._is_stdio_mode:
-            if session is None:
-                return
-            await self._load_indexes_from_session(session)
-        else:
+        if not self._is_stdio_mode:
             # 多业务模式：从每个 MCP server 获取索引信息
             for entry in self.registry.list_businesses():
                 try:
-                    result_text = await self.registry.call_tool(
-                        entry.name, "get_table_indexes", {"cluster": "placeholder"}
+                    # 先获取集群列表，再用真实集群名获取索引
+                    clusters_text = await self.registry.call_tool(
+                        entry.name, "get_cluster_list", {}
                     )
-                    self._parse_and_cache_indexes(result_text)
+                    clusters_data = _json.loads(clusters_text)
+                    cluster_list = [
+                        c["name"] for c in clusters_data.get("clusters", [])
+                        if c.get("status") == "connected"
+                    ]
+                    if cluster_list:
+                        result_text = await self.registry.call_tool(
+                            entry.name, "get_table_indexes", {"cluster": cluster_list[0]}
+                        )
+                        self._parse_and_cache_indexes(result_text)
                 except Exception:
                     logger.warning("获取业务 '%s' 索引信息失败", entry.name, exc_info=True)
 
+        self._indexes_loaded = True
+
+    async def _ensure_indexes_loaded_stdio(self, session: ClientSession) -> None:
+        """确保索引信息已加载到风险检测器中（stdio 模式，需要 session）。"""
+        if self._indexes_loaded:
+            return
+
+        await self._load_indexes_from_session(session)
         self._indexes_loaded = True
 
     async def _load_indexes_from_session(self, session: ClientSession) -> None:
@@ -399,14 +524,13 @@ class QueryAgent:
             logger.debug("解析索引信息失败", exc_info=True)
 
     async def _pre_execute_check(
-        self, tool_name: str, arguments: dict, session: ClientSession | None = None
+        self, tool_name: str, arguments: dict
     ) -> str | None:
         """执行前检查：打印 SQL，检测性能风险，等待确认。
 
         Args:
             tool_name: 工具名称。
             arguments: 工具参数。
-            session: stdio 模式下的 MCP session（用于加载索引）。
 
         Returns:
             None: 允许执行。
@@ -415,22 +539,21 @@ class QueryAgent:
         if tool_name != "execute_readonly_sql":
             return None
 
-        sql = arguments.get("sql", "")
-        cluster = arguments.get("cluster", "")
+        sql = arguments.get("sql", "") if isinstance(arguments, dict) else ""
+        cluster = arguments.get("cluster", "") if isinstance(arguments, dict) else ""
 
         # 1. 打印 SQL
-        print(f"\n📝 即将执行 SQL (集群: {cluster}):")
-        print(f"   {sql}")
+        print(f"  SQL ({cluster}): {sql}")
 
         # 2. 确保索引信息已加载
-        await self._ensure_indexes_loaded(session)
+        await self._ensure_indexes_loaded()
 
         # 3. 性能风险检测
         risk_result = self._risk_checker.check(sql)
         if risk_result.has_risk:
-            print(f"\n⚠️  性能风险 [{risk_result.risk_level}]:")
+            print(f"  Risk [{risk_result.risk_level}]:")
             for reason in risk_result.risk_reasons:
-                print(f"   - {reason}")
+                print(f"    - {reason}")
 
             # 4. 等待用户确认
             if not self._confirm_callback("是否继续执行？(y/N): "):
@@ -448,23 +571,29 @@ class QueryAgent:
         answer = input(f"   {prompt}").strip().lower()
         return answer == "y"
 
-    async def _conversation_loop(
+    async def _conversation_loop_core(
         self,
-        session: ClientSession,
         tools: list[dict],
         user_input: str,
         metrics: QueryMetrics,
+        system_prompt: str | None,
+        execute_tool: "Callable[[str, dict, str], Awaitable[tuple[str, str]]]",
     ) -> str:
-        """执行消息循环（单业务模式），处理工具调用直到获得最终文本响应。
+        """通用对话循环，工具执行通过 execute_tool 回调注入。
 
-        使用多轮对话历史提供上下文，让 Agent 理解引用关系。
-        通过 LLM Provider 抽象层支持不同模型。
+        Args:
+            tools: LLM 可用的工具列表。
+            user_input: 用户输入。
+            metrics: 查询元信息。
+            system_prompt: 系统提示词，为 None 时自动构建。
+            execute_tool: 工具执行器，签名 (tool_name, arguments, business) -> (result_text, business)。
         """
         self._trim_history()
         messages = list(self._conversation_history)
         messages.append({"role": "user", "content": user_input})
 
-        system_prompt = self._build_system_prompt()
+        if system_prompt is None:
+            system_prompt = self._build_system_prompt()
 
         while True:
             response = self.provider.chat(
@@ -496,24 +625,37 @@ class QueryAgent:
             tool_results = []
             for tc in (response.tool_calls or []):
                 metrics.tool_calls += 1
-                logger.info("调用工具: %s(%s)", tc.name, tc.arguments)
+
+                # 提前保存 business（多业务模式下 _route_tool_call 会 pop 掉）
+                tc_business = tc.arguments.get("business", "") if isinstance(tc.arguments, dict) else ""
 
                 # 执行前检查（打印 SQL、性能风险检测、用户确认）
-                cancel_result = await self._pre_execute_check(
-                    tc.name, tc.arguments, session
-                )
+                cancel_result = await self._pre_execute_check(tc.name, tc.arguments)
                 if cancel_result is not None:
                     result_text = cancel_result
                 else:
-                    result = await session.call_tool(tc.name, tc.arguments)
-                    result_text = self._serialize_tool_result(result)
+                    result_text, resolved_business = await execute_tool(tc.name, tc.arguments, tc_business)
+                    if not tc_business and resolved_business:
+                        tc_business = resolved_business
+
+                logger.info("调用工具: %s(%s)", tc.name, _sanitize_args_for_log(tc.arguments))
 
                 self._check_and_record_error(
-                    user_input, tc.name, tc.arguments, result_text
+                    user_input, tc.name, tc.arguments, result_text, tc_business
                 )
 
+                # 追踪最近查询上下文（用于反馈检测）
+                if tc.name == "execute_readonly_sql":
+                    self._last_query_context = {
+                        "business": tc_business or "default",
+                        "query": user_input,
+                        "sql": tc.arguments.get("sql", "") if isinstance(tc.arguments, dict) else "",
+                    }
+
                 tool_results.append(
-                    self.provider.build_tool_result_message(tc.id, result_text)
+                    self.provider.build_tool_result_message(
+                        tc.id, self._summarize_tool_result(tc.name, result_text)
+                    )
                 )
 
             # Anthropic: tool_results 作为 user message 的 content 列表
@@ -530,66 +672,14 @@ class QueryAgent:
         metrics: QueryMetrics,
         system_prompt: str,
     ) -> str:
-        """执行消息循环（多业务模式），通过 BusinessRegistry 路由工具调用。
+        """执行消息循环（多业务模式），通过 BusinessRegistry 路由工具调用。"""
+        async def execute_tool(name: str, args: dict, _business: str) -> tuple[str, str]:
+            result_text = await self._route_tool_call(name, args)
+            return result_text, _business
 
-        LLM 在工具调用中指定 business 参数，Agent 从中提取并路由到对应 MCP Server。
-        """
-        self._trim_history()
-        messages = list(self._conversation_history)
-        messages.append({"role": "user", "content": user_input})
-
-        while True:
-            response = self.provider.chat(
-                model=self.config.agent.model,
-                max_tokens=self.config.agent.max_tokens,
-                system=system_prompt,
-                tools=tools,
-                messages=messages,
-            )
-
-            metrics.input_tokens += response.input_tokens
-            metrics.output_tokens += response.output_tokens
-
-            if response.stop_reason == "end_turn":
-                # 保存到对话历史
-                self._conversation_history.append(
-                    {"role": "user", "content": user_input}
-                )
-                self._conversation_history.append(
-                    {"role": "assistant", "content": response.text}
-                )
-                return response.text
-
-            # 处理工具调用
-            messages.append(
-                self.provider.build_assistant_message(response.raw_content)
-            )
-
-            tool_results = []
-            for tc in (response.tool_calls or []):
-                metrics.tool_calls += 1
-
-                # 执行前检查（打印 SQL、性能风险检测、用户确认）
-                cancel_result = await self._pre_execute_check(tc.name, tc.arguments)
-                if cancel_result is not None:
-                    result_text = cancel_result
-                else:
-                    result_text = await self._route_tool_call(tc.name, tc.arguments)
-
-                logger.info("调用工具: %s(%s) -> %s", tc.name, tc.arguments, result_text[:200])
-
-                self._check_and_record_error(
-                    user_input, tc.name, tc.arguments, result_text
-                )
-
-                tool_results.append(
-                    self.provider.build_tool_result_message(tc.id, result_text)
-                )
-
-            if self.config.agent.provider == "anthropic":
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                messages.extend(tool_results)
+        return await self._conversation_loop_core(
+            tools, user_input, metrics, system_prompt=system_prompt, execute_tool=execute_tool,
+        )
 
     async def _route_tool_call(self, tool_name: str, arguments: dict) -> str:
         """路由工具调用到对应的业务 MCP Server。
@@ -637,8 +727,12 @@ class QueryAgent:
         tool_name: str,
         tool_input: dict,
         result_text: str,
+        business: str = "",
     ) -> None:
-        """检测工具返回的错误并记录到错误记忆。"""
+        """检测工具返回的错误并记录到错误记忆。
+
+        跳过环境/基础设施错误和 SQL 语法错误，这些不是 Agent 可学习的经验。
+        """
         try:
             result = _json.loads(result_text)
         except (ValueError, TypeError):
@@ -649,7 +743,24 @@ class QueryAgent:
 
         error_type = result.get("error_type", "UNKNOWN")
         error_message = result.get("error_message", "")
+
+        # 跳过环境/基础设施错误，Agent 无法从这些错误中学习
+        _SKIP_ERROR_TYPES = {
+            "CONNECTION_ERROR",    # 数据库连接失败
+            "CONFIG_ERROR",       # 配置缺失或无效
+            "POOL_ERROR",        # 连接池错误
+            "TIMEOUT_ERROR",     # 连接超时
+            "QUERY_ERROR",       # SQL 语法错误 — Agent 应先 get_table_schema 了解表结构
+        }
+        if error_type in _SKIP_ERROR_TYPES:
+            logger.debug("跳过错误，不记录: %s - %s", error_type, error_message)
+            return
+
         bad_sql = tool_input.get("sql", "") if isinstance(tool_input, dict) else ""
+
+        # 使用传入的 business（多业务模式下 _route_tool_call 会 pop 掉 arguments 中的 business）
+        if not business and self._is_stdio_mode:
+            business = "default"
 
         # 根据错误类型生成经验教训
         lesson = self._generate_lesson(error_type, error_message, bad_sql)
@@ -657,10 +768,12 @@ class QueryAgent:
         self.error_memory.add_error(
             user_query=user_query,
             error_type=error_type,
+            business=business,
             bad_sql=bad_sql,
             error_message=error_message,
             lesson=lesson,
         )
+        self._mark_prompt_dirty()
         logger.info("已记录错误到记忆: %s - %s", error_type, lesson)
 
     @staticmethod
@@ -682,7 +795,52 @@ class QueryAgent:
             return f"使用正确的业务标识。{error_message}"
         if error_type == "USER_CANCELLED":
             return "查询被用户取消，需要优化查询条件或获取用户确认"
+        if error_type == "USER_FEEDBACK":
+            return f"用户反馈: {error_message}"
         return f"{error_type}: {error_message}"
+
+    async def extract_feedback_lesson(
+        self,
+        original_query: str,
+        agent_response: str,
+        user_feedback: str,
+    ) -> str | None:
+        """用 LLM 从用户反馈中提取经验教训。
+
+        Args:
+            original_query: 用户的原始查询。
+            agent_response: Agent 的回答。
+            user_feedback: 用户的后续输入。
+
+        Returns:
+            经验教训字符串，如果不是反馈则返回 None。
+        """
+        prompt = (
+            f'用户刚才问了: "{original_query}"\n\n'
+            f'Agent 回答了: "{agent_response[:500]}"\n\n'
+            f'用户接下来输入了: "{user_feedback}"\n\n'
+            "请判断用户接下来的输入是否是对 Agent 回答的反馈/纠正/补充？\n"
+            "- 如果是全新的、不相关的查询 → 回答: NONE\n"
+            "- 如果是反馈/纠正 → 提取一条简洁的经验教训（一句话），以\"应该\"开头\n\n"
+            "只回答 NONE 或一条经验教训，不要其他内容。"
+        )
+
+        try:
+            response = self.provider.chat(
+                model=self.config.agent.model,
+                max_tokens=200,
+                system="你是一个经验提取助手，从用户反馈中提取简洁的经验教训。",
+                tools=[],
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            lesson = response.text.strip()
+            if lesson.upper() == "NONE" or not lesson:
+                return None
+            return lesson
+        except Exception:
+            logger.debug("提取反馈经验失败", exc_info=True)
+            return None
 
     @staticmethod
     def _serialize_tool_result(result) -> str:
@@ -694,3 +852,58 @@ class QueryAgent:
             else:
                 texts.append(str(item))
         return "\n".join(texts) if texts else ""
+
+    MAX_CELL_LENGTH = 200  # 单个单元格最大字符数
+
+    @staticmethod
+    def _summarize_tool_result(tool_name: str, result_text: str) -> str:
+        """精简工具结果，减少回传给 LLM 的 token 消耗。
+
+        - get_table_schema: 去掉 default、extra 等低价值字段
+        - execute_readonly_sql: 超过 10 行时只保留前 10 行，单元格超长截断
+        """
+        try:
+            data = _json.loads(result_text)
+        except (ValueError, TypeError):
+            return result_text
+
+        if tool_name == "get_table_schema" and isinstance(data, dict) and "columns" in data:
+            simplified_columns = []
+            for col in data.get("columns", []):
+                simplified_columns.append({
+                    "name": col.get("name"),
+                    "type": col.get("type"),
+                    "nullable": col.get("nullable"),
+                    "key": col.get("key", ""),
+                })
+            data["columns"] = simplified_columns
+            return _json.dumps(data, ensure_ascii=False)
+
+        if tool_name == "execute_readonly_sql" and isinstance(data, dict) and "rows" in data:
+            rows = data.get("rows", [])
+
+            # 截断行数
+            if len(rows) > 10:
+                rows = rows[:10]
+                data["row_count"] = len(data.get("rows", []))
+                data["truncated"] = True
+                data["note"] = f"共 {data['row_count']} 行，仅展示前 10 行"
+
+            # 截断列宽
+            truncated_rows = []
+            for row in rows:
+                if isinstance(row, list):
+                    truncated_row = []
+                    for cell in row:
+                        cell_str = str(cell) if cell is not None else None
+                        if cell_str and len(cell_str) > QueryAgent.MAX_CELL_LENGTH:
+                            cell_str = cell_str[:QueryAgent.MAX_CELL_LENGTH] + "..."
+                        truncated_row.append(cell_str)
+                    truncated_rows.append(truncated_row)
+                else:
+                    truncated_rows.append(row)
+
+            data["rows"] = truncated_rows
+            return _json.dumps(data, ensure_ascii=False)
+
+        return result_text

@@ -5,12 +5,14 @@ _merge_tools_with_business_param、_route_tool_call
 以及 QueryAgent 的初始化和消息循环逻辑。
 """
 
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.agent import QueryAgent, _convert_mcp_tools_to_anthropic, _merge_tools_with_business_param
+from src.error_memory import ErrorMemoryManager
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +278,7 @@ businesses:
 
 
 # ---------------------------------------------------------------------------
-# _conversation_loop (single business stdio mode)
+# _conversation_loop_core (unified conversation loop)
 # ---------------------------------------------------------------------------
 
 
@@ -313,12 +315,16 @@ agent:
         )
         agent.provider.chat = MagicMock(return_value=mock_response)
 
-        session = AsyncMock()
         tools = [{"name": "execute_readonly_sql", "description": "...", "input_schema": {}}]
+
+        async def execute_tool(name, args, business):
+            return '{"success": true}', "default"
 
         from src.agent import QueryMetrics
         metrics = QueryMetrics(model="test-model")
-        result = await agent._conversation_loop(session, tools, "有多少条记录？", metrics)
+        result = await agent._conversation_loop_core(
+            tools, "有多少条记录？", metrics, None, execute_tool
+        )
         assert result == "共有 42 条记录"
 
     @pytest.mark.asyncio
@@ -379,23 +385,19 @@ agent:
             }
         )
 
-        # Mock MCP session.call_tool
-        session = AsyncMock()
-        tool_result = MagicMock()
-        tool_result.content = [FakeToolResultContent(text='{"success": true, "row_count": 1}')]
-        session.call_tool = AsyncMock(return_value=tool_result)
+        # Mock execute_tool callback
+        async def execute_tool(name, args, business):
+            return '{"success": true, "row_count": 1}', "default"
 
         tools = [{"name": "execute_readonly_sql", "description": "...", "input_schema": {}}]
 
         from src.agent import QueryMetrics
         metrics = QueryMetrics(model="test-model")
-        result = await agent._conversation_loop(session, tools, "有多少条记录？", metrics)
+        result = await agent._conversation_loop_core(
+            tools, "有多少条记录？", metrics, None, execute_tool
+        )
 
         assert result == "查询结果：42"
-        session.call_tool.assert_called_once_with(
-            "execute_readonly_sql",
-            {"cluster": "test", "sql": "SELECT COUNT(*) FROM tb_scene"},
-        )
         assert agent.provider.chat.call_count == 2
 
 
@@ -553,3 +555,464 @@ agent:
         )
         assert result is None
         assert not confirm_called
+
+
+class TestCheckAndRecordErrorBusiness:
+    async def test_records_business_from_tool_input(self, tmp_path):
+        """多业务模式下从 tool_input 提取 business。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        # 使用临时目录避免测试间共享 error_memory
+        agent.error_memory = ErrorMemoryManager(
+            memory_path=str(tmp_path / "error_memory.json")
+        )
+
+        import json
+        result_text = json.dumps({
+            "success": False,
+            "error_type": "FORBIDDEN_TABLE",
+            "error_message": "表 xxx 不在白名单中",
+        })
+
+        agent._check_and_record_error(
+            user_query="查数字人",
+            tool_name="execute_readonly_sql",
+            tool_input={"business": "digitalhuman", "sql": "SELECT * FROM xxx"},
+            result_text=result_text,
+            business="digitalhuman",
+        )
+
+        entries = agent.error_memory.get_entries()
+        assert len(entries) == 1
+        assert entries[0].business == "digitalhuman"
+
+    async def test_records_business_default_for_stdio(self, tmp_path):
+        """stdio 模式下 business 默认为 'default'。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.error_memory = ErrorMemoryManager(
+            memory_path=str(tmp_path / "error_memory.json")
+        )
+
+        import json
+        result_text = json.dumps({
+            "success": False,
+            "error_type": "UNSAFE_SQL",
+            "error_message": "包含写操作",
+        })
+
+        agent._check_and_record_error(
+            user_query="查数据",
+            tool_name="execute_readonly_sql",
+            tool_input={"sql": "DELETE FROM tb_scene"},
+            result_text=result_text,
+        )
+
+        entries = agent.error_memory.get_entries()
+        assert len(entries) == 1
+        assert entries[0].business == "default"
+
+
+class TestGenerateLessonUserFeedback:
+    def test_user_feedback_lesson(self):
+        lesson = QueryAgent._generate_lesson("USER_FEEDBACK", "不对，应该只查测试环境", "")
+        assert "用户反馈" in lesson
+
+
+class TestSkipUnrecordedErrors:
+    async def test_connection_error_not_recorded(self, tmp_path):
+        """CONNECTION_ERROR 不记录到错误记忆。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+        agent.error_memory = ErrorMemoryManager(
+            memory_path=str(tmp_path / "error_memory.json")
+        )
+
+        import json
+        result_text = json.dumps({
+            "success": False,
+            "error_type": "CONNECTION_ERROR",
+            "error_message": "集群 'test' 连接失败",
+        })
+
+        agent._check_and_record_error(
+            user_query="查数据",
+            tool_name="execute_readonly_sql",
+            tool_input={"sql": "SELECT 1"},
+            result_text=result_text,
+        )
+
+        entries = agent.error_memory.get_entries()
+        assert len(entries) == 0
+
+    async def test_config_error_not_recorded(self, tmp_path):
+        """CONFIG_ERROR 不记录到错误记忆。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+        agent.error_memory = ErrorMemoryManager(
+            memory_path=str(tmp_path / "error_memory.json")
+        )
+
+        import json
+        result_text = json.dumps({
+            "success": False,
+            "error_type": "CONFIG_ERROR",
+            "error_message": "环境变量未设置",
+        })
+
+        agent._check_and_record_error(
+            user_query="查数据",
+            tool_name="execute_readonly_sql",
+            tool_input={"sql": "SELECT 1"},
+            result_text=result_text,
+        )
+
+        entries = agent.error_memory.get_entries()
+        assert len(entries) == 0
+
+    async def test_query_error_not_recorded(self, tmp_path):
+        """QUERY_ERROR（SQL 语法错误）不记录 — Agent 应先查表结构。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+        agent.error_memory = ErrorMemoryManager(
+            memory_path=str(tmp_path / "error_memory.json")
+        )
+
+        import json
+        result_text = json.dumps({
+            "success": False,
+            "error_type": "QUERY_ERROR",
+            "error_message": "语法错误",
+        })
+
+        agent._check_and_record_error(
+            user_query="查数据",
+            tool_name="execute_readonly_sql",
+            tool_input={"sql": "SELECT name FROM tb_scene"},
+            result_text=result_text,
+        )
+
+        entries = agent.error_memory.get_entries()
+        assert len(entries) == 0
+
+
+class TestExtractFeedbackLesson:
+    async def test_returns_none_for_new_query(self, tmp_path):
+        """当用户输入是新查询时返回 None。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        # Mock provider.chat to return NONE
+        mock_response = MagicMock()
+        mock_response.text = "NONE"
+        agent.provider.chat = MagicMock(return_value=mock_response)
+
+        result = await agent.extract_feedback_lesson(
+            original_query="查数字人数量",
+            agent_response="共有 100 个数字人",
+            user_feedback="查一下训练任务数量",
+        )
+        assert result is None
+
+    async def test_returns_lesson_for_feedback(self, tmp_path):
+        """当用户输入是反馈时返回经验教训。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        # Mock provider.chat to return a lesson
+        mock_response = MagicMock()
+        mock_response.text = "应该只查询测试环境的数据，不要查生产环境"
+        agent.provider.chat = MagicMock(return_value=mock_response)
+
+        result = await agent.extract_feedback_lesson(
+            original_query="查数字人数量",
+            agent_response="生产环境共有 100 个数字人",
+            user_feedback="不对，我只要测试环境的",
+        )
+        assert result == "应该只查询测试环境的数据，不要查生产环境"
+
+    async def test_returns_none_on_exception(self, tmp_path):
+        """LLM 调用失败时返回 None。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.provider.chat = MagicMock(side_effect=Exception("API error"))
+
+        result = await agent.extract_feedback_lesson(
+            original_query="test",
+            agent_response="response",
+            user_feedback="feedback",
+        )
+        assert result is None
+
+
+class TestSummarizeToolResult:
+    """Test _summarize_tool_result method."""
+
+    def test_schema_columns_simplified(self):
+        result_text = json.dumps({
+            "table_name": "tb_scene",
+            "columns": [
+                {"name": "id", "type": "bigint", "nullable": False, "key": "PRI",
+                 "default": None, "extra": "auto_increment"},
+                {"name": "name", "type": "varchar(100)", "nullable": True, "key": "",
+                 "default": "", "extra": ""},
+            ],
+        })
+        result = QueryAgent._summarize_tool_result("get_table_schema", result_text)
+        data = json.loads(result)
+        for col in data["columns"]:
+            assert "default" not in col
+            assert "extra" not in col
+            assert "name" in col
+            assert "type" in col
+
+    def test_sql_result_truncated_over_10_rows(self):
+        rows = [[i, f"name_{i}"] for i in range(20)]
+        result_text = json.dumps({
+            "success": True,
+            "columns": ["id", "name"],
+            "rows": rows,
+            "row_count": 20,
+            "truncated": False,
+        })
+        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        data = json.loads(result)
+        assert len(data["rows"]) == 10
+        assert data["row_count"] == 20
+        assert data["truncated"] is True
+        assert "仅展示前 10 行" in data["note"]
+
+    def test_sql_result_not_truncated_under_10_rows(self):
+        rows = [[i, f"name_{i}"] for i in range(5)]
+        result_text = json.dumps({
+            "success": True,
+            "columns": ["id", "name"],
+            "rows": rows,
+            "row_count": 5,
+            "truncated": False,
+        })
+        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        data = json.loads(result)
+        assert len(data["rows"]) == 5
+        assert "note" not in data
+
+    def test_error_result_passthrough(self):
+        result_text = json.dumps({"success": False, "error_type": "CONNECTION_ERROR", "error_message": "fail"})
+        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        assert result == result_text
+
+    def test_non_json_passthrough(self):
+        result = QueryAgent._summarize_tool_result("execute_readonly_sql", "not json")
+        assert result == "not json"
+
+
+class TestTrimHistory:
+    """Test conversation history compression."""
+
+    def _make_agent(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+""")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            return QueryAgent(config_path=str(config_file))
+
+    def test_short_history_not_compressed(self, tmp_path):
+        agent = self._make_agent(tmp_path)
+        # 6 messages = 3 turns, should not compress
+        agent._conversation_history = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+        agent._trim_history()
+        assert len(agent._conversation_history) == 6
+
+    def test_long_history_compresses_older(self, tmp_path):
+        agent = self._make_agent(tmp_path)
+        # 10 messages = 5 turns, older should compress
+        history = []
+        for i in range(1, 6):
+            history.append({"role": "user", "content": f"query {i}"})
+            history.append({"role": "assistant", "content": f"answer {i}"})
+        agent._conversation_history = history
+        agent._trim_history()
+
+        # Recent 3 turns (6 messages) should be intact
+        recent = agent._conversation_history[-6:]
+        assert recent[0]["content"] == "query 3"
+        assert recent[1]["content"] == "answer 3"
+
+        # Older turns should be compressed (only user + [历史] assistant)
+        older = agent._conversation_history[:-6]
+        assert any("[历史]" in m.get("content", "") for m in older)
+
+    def test_extract_text_from_string_content(self):
+        assert QueryAgent._extract_text_from_content("hello") == "hello"
+
+    def test_extract_text_from_block_list(self):
+        content = [
+            {"type": "text", "text": "hello "},
+            {"type": "text", "text": "world"},
+        ]
+        assert QueryAgent._extract_text_from_content(content) == "hello \nworld"
+
+    def test_extract_text_from_empty(self):
+        assert QueryAgent._extract_text_from_content(None) == ""

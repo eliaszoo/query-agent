@@ -71,6 +71,14 @@ class BusinessEntryConfig:
     name: str  # 业务标识，如 "digitalhuman"
     display_name: str  # 显示名，如 "数字人"
     mcp_server_url: str  # MCP Server SSE URL
+    api_key: str = ""  # MCP Server 鉴权密钥，为空则不传鉴权 Header
+
+
+@dataclass
+class AuthConfig:
+    """MCP Server 鉴权配置。"""
+
+    api_key: str = ""  # 鉴权密钥，为空则不启用鉴权
 
 
 @dataclass
@@ -82,6 +90,7 @@ class AppConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     business_knowledge: BusinessKnowledge = field(default_factory=BusinessKnowledge)
     businesses: dict[str, BusinessEntryConfig] = field(default_factory=dict)
+    auth: AuthConfig = field(default_factory=AuthConfig)
 
 
 # 环境变量占位符正则：匹配 ${VAR_NAME}
@@ -175,6 +184,11 @@ def _validate_config(raw: dict) -> None:
     if businesses is not None and not isinstance(businesses, dict):
         raise ConfigError("'businesses' 配置格式无效")
 
+    # 验证 auth（可选但如果存在需要合法）
+    auth = raw.get("auth")
+    if auth is not None and not isinstance(auth, dict):
+        raise ConfigError("'auth' 配置格式无效")
+
 
 def _build_app_config(raw: dict) -> AppConfig:
     """从原始字典构建类型安全的 AppConfig。
@@ -239,6 +253,7 @@ def _build_app_config(raw: dict) -> AppConfig:
             name=biz_name,
             display_name=biz_cfg.get("display_name", biz_name),
             mcp_server_url=biz_cfg.get("mcp_server_url", ""),
+            api_key=biz_cfg.get("api_key", ""),
         )
 
     # 向后兼容：如果配置了 agent.mcp_server_url 但没有 businesses，
@@ -248,7 +263,14 @@ def _build_app_config(raw: dict) -> AppConfig:
             name="default",
             display_name=business_knowledge.description or "默认业务",
             mcp_server_url=agent.mcp_server_url,
+            api_key=agent_raw.get("mcp_api_key", ""),
         )
+
+    # 构建鉴权配置
+    auth_raw = raw.get("auth", {})
+    auth = AuthConfig(
+        api_key=auth_raw.get("api_key", ""),
+    )
 
     return AppConfig(
         clusters=clusters,
@@ -256,6 +278,7 @@ def _build_app_config(raw: dict) -> AppConfig:
         agent=agent,
         business_knowledge=business_knowledge,
         businesses=businesses,
+        auth=auth,
     )
 
 

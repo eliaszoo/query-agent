@@ -28,11 +28,11 @@ agent:
   # base_url: "https://api.openai.com/v1"
 
   # --- GLM (智谱) ---
-  # provider: "openai_compatible"
-  # model: "glm-4-plus"
-  # max_tokens: 4096
-  # api_key: "${ZHIPU_API_KEY}"
-  # base_url: "https://open.bigmodel.cn/api/paas/v4"
+  provider: "openai_compatible"
+  model: "glm-5.1"
+  max_tokens: 4096
+  api_key: "${LLM_API_KEY}"
+  base_url: "${LLM_BASE_URL}"
 
   # --- Qwen (通义千问) ---
   # provider: "openai_compatible"
@@ -48,7 +48,8 @@ agent:
 businesses:
   digitalhuman:
     display_name: "数字人"
-    mcp_server_url: "http://mcp-host:8765/sse"
+    mcp_server_url: "http://47.103.32.134:8765/sse"
+    api_key: "${MCP_API_KEY}"  # 与 MCP Server 共享的鉴权密钥
   # 添加更多业务：
   # order:
   #   display_name: "订单"
