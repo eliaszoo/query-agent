@@ -8,6 +8,7 @@
 import json as _json
 import logging
 import os
+import re as _re
 import sys
 import time
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from mcp.client.sse import sse_client
 from src.business_registry import BusinessRegistry
 from src.config import load_config, AppConfig, BusinessKnowledge, BusinessEntryConfig
 from src.error_memory import ErrorMemoryManager
+from src.field_knowledge import FieldKnowledgeManager
 from src.llm_provider import LLMProvider, create_provider
 from src.prompts import build_system_prompt
 from src.sql_risk_checker import SQLRiskChecker, IndexInfo
@@ -158,6 +160,7 @@ class QueryAgent:
             base_url=self.config.agent.base_url or None,
         )
         self.error_memory = ErrorMemoryManager()
+        self.field_knowledge = FieldKnowledgeManager()
         self.last_metrics: Optional[QueryMetrics] = None
 
         # 多轮对话历史
@@ -215,6 +218,16 @@ class QueryAgent:
             knowledge_map["default"] = self._business_knowledge
 
         prompt = build_system_prompt(businesses, knowledge_map)
+
+        # 字段知识：查询过程中确认的字段含义
+        field_prompt = self.field_knowledge.build_field_prompt()
+        if field_prompt:
+            prompt += field_prompt
+
+        # 已缓存的表结构：已知列名，无需再查 schema
+        schema_prompt = self.field_knowledge.build_schema_prompt()
+        if schema_prompt:
+            prompt += schema_prompt
 
         # 错误记忆：单业务模式按业务过滤，多业务模式注入全部
         current_business = ""
@@ -615,6 +628,10 @@ class QueryAgent:
                 self._conversation_history.append(
                     {"role": "assistant", "content": response.text}
                 )
+
+                # 自动提取回复中明确标注的字段含义并持久化
+                self._auto_extract_field_knowledge(response.text)
+
                 return response.text
 
             # 处理工具调用
@@ -646,6 +663,11 @@ class QueryAgent:
                         tc_business = resolved_business
 
                 logger.info("调用工具: %s(%s)", tc.name, _sanitize_args_for_log(tc.arguments))
+
+                # 缓存 get_table_schema 的结果，避免重复查询
+                if tc.name == "get_table_schema":
+                    self._cache_schema_from_result(tc.arguments, result_text)
+                    self._mark_prompt_dirty()
 
                 self._check_and_record_error(
                     user_input, tc.name, tc.arguments, result_text, tc_business
@@ -848,6 +870,79 @@ class QueryAgent:
         except Exception:
             logger.debug("提取反馈经验失败", exc_info=True)
             return None
+
+    # 字段含义自动提取的正则：匹配 "字段名(枚举值)" 模式
+    # 如: origin: 1(自研), 2(阿里云)  或  forbidden_status: 1(正常), 2(禁用)
+    _FIELD_ENUM_PATTERN = _re.compile(
+        r'(\w+)\s*[：:]\s*'           # 字段名 + 冒号
+        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',  # 1(自研), 2(阿里云), ...
+        _re.UNICODE
+    )
+    _TABLE_FIELD_PATTERN = _re.compile(        r'(tb_\w+)\.(\w+)\s*[：:]\s*'  # tb_voice.origin:
+        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',  # 枚举值
+        _re.UNICODE
+    )
+
+    def _auto_extract_field_knowledge(self, response_text: str) -> None:
+        """从 LLM 回复中自动提取字段含义并持久化到 field_knowledge。
+
+        匹配两种模式:
+        1. "tb_voice.origin: 1(自研), 2(阿里云)" → 直接提取
+        2. "origin: 1(自研), 2(阿里云)" → 需结合 SQL 中的表名
+        """
+        dirty = False
+
+        # 模式1: 表名.字段名: 枚举值
+        for match in self._TABLE_FIELD_PATTERN.finditer(response_text):
+            table = match.group(1)
+            column = match.group(2)
+            raw_values = match.group(3)
+            description = self._parse_enum_values(raw_values)
+            if description:
+                self.field_knowledge.add_field(table, column, description)
+                dirty = True
+                logger.info("自动提取字段知识: %s.%s: %s", table, column, description)
+
+        # 模式2: 字段名: 枚举值（无表名前缀，从最近 SQL 上下文推断表名）
+        if not dirty and self._last_query_context:
+            sql = self._last_query_context.get("sql", "")
+            if sql:
+                # 从 SQL 中提取表名
+                table_match = _re.search(r'FROM\s+(tb_\w+)', sql, _re.IGNORECASE)
+                if table_match:
+                    table = table_match.group(1)
+                    for match in self._FIELD_ENUM_PATTERN.finditer(response_text):
+                        column = match.group(1)
+                        raw_values = match.group(2)
+                        description = self._parse_enum_values(raw_values)
+                        if description and not column.startswith('tb_'):
+                            self.field_knowledge.add_field(table, column, description)
+                            dirty = True
+                            logger.info("自动提取字段知识: %s.%s: %s", table, column, description)
+
+        if dirty:
+            self._mark_prompt_dirty()
+
+    @staticmethod
+    def _parse_enum_values(raw: str) -> str:
+        """解析 "1(自研), 2(阿里云), 3(腾讯云)" 格式为 "1=自研, 2=阿里云, 3=腾讯云"。"""
+        parts = _re.findall(r'(\d+)\s*[（(]\s*([^）)]+)\s*[）)]', raw)
+        if not parts:
+            return ""
+        return ", ".join(f"{num}={label.strip()}" for num, label in parts)
+
+    def _cache_schema_from_result(self, arguments: dict, result_text: str) -> None:
+        """从 get_table_schema 结果中缓存表结构，注入 prompt 避免重复查询。"""
+        try:
+            data = _json.loads(result_text)
+            if isinstance(data, dict) and "columns" in data:
+                table_name = data.get("table_name") or (arguments.get("table_name") if isinstance(arguments, dict) else "")
+                if table_name:
+                    columns = [{"name": c.get("name"), "type": c.get("type")} for c in data.get("columns", [])]
+                    self.field_knowledge.cache_table_schema(table_name, columns)
+                    logger.info("已缓存表结构: %s (%d 列)", table_name, len(columns))
+        except (ValueError, TypeError):
+            pass
 
     @staticmethod
     def _serialize_tool_result(result) -> str:

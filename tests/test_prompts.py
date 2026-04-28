@@ -83,7 +83,7 @@ class TestBuildSystemPromptSingleBusiness:
         """查询规则始终存在。"""
         prompt = build_system_prompt()
         assert "1. 始终使用 execute_readonly_sql 工具执行查询" in prompt
-        assert "2. 查询前可使用 get_table_schema 了解表结构" in prompt
+        assert "2. 首次查询某张表时，必须先调用 get_table_schema 了解列名" in prompt
         assert "3. 使用 get_cluster_list 查看可用集群" in prompt
         assert "4. 默认查询测试集群" in prompt
         assert "5. 注意 deleted_at IS NULL" in prompt

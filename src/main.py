@@ -2,15 +2,86 @@
 
 import argparse
 import asyncio
+import readline
 import sys
+import threading
+import time
 
 from src.agent import QueryAgent
 from src.config import load_config
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
 
+# Slash 命令定义：命令名 → (补全文本, 简短说明)
+SLASH_COMMANDS = {
+    "/add":      ("/add ",      "Add business"),
+    "/clear":    ("/clear ",    "Clear error memory"),
+    "/exit":     ("/exit",      "Exit"),
+    "/field":    ("/field ",    "Add field knowledge"),
+    "/field_rm": ("/field_rm ", "Remove field knowledge"),
+    "/fields":   ("/fields",    "List field knowledge"),
+    "/list":     ("/list",      "List businesses"),
+    "/memory":   ("/memory",    "Show error memory"),
+    "/new":      ("/new",       "New conversation"),
+    "/pin":      ("/pin ",      "Pin context message"),
+    "/quit":     ("/quit",      "Exit"),
+    "/remove":   ("/remove ",   "Remove business"),
+}
+
+
+def _slash_completer(text: str, state: int):
+    """readline 补全函数：输入 / 时列出匹配的命令，显示简短说明。"""
+    # 只对以 / 开头的输入进行补全
+    line = readline.get_line_buffer().lstrip()
+    if not line.startswith("/"):
+        return None
+
+    matches = [cmd for cmd in SLASH_COMMANDS if cmd.startswith(text)]
+    if state < len(matches):
+        # 返回补全文本（带空格的命令表示需要参数）
+        return SLASH_COMMANDS[matches[state]][0]
+    return None
+
+
+def _display_hook(substitutions, matches, longest_hit_len):
+    """自定义补全显示：每条命令附带说明。"""
+    if not matches:
+        return
+
+    # matches 可能是补全文本（带空格），我们需要映射回命令名
+    cmd_to_desc = {v[0]: v[1] for v in SLASH_COMMANDS.values()}
+
+    lines = []
+    for m in matches:
+        desc = cmd_to_desc.get(m, "")
+        lines.append(f"  {_CYAN}{m}{_RESET}  {_DIM}{desc}{_RESET}")
+
+    print()
+    print("\n".join(lines))
+    # 重新打印 prompt
+    prompt = f"\n{_BOLD}>{_RESET} "
+    readline.redisplay()
+
+
+def _setup_readline():
+    """配置 readline 补全行为。"""
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(_slash_completer)
+    readline.set_completion_display_matches_hook(_display_hook)
+    # macOS libedit 和 GNU readline 用不同绑定
+    try:
+        readline.parse_and_bind("tab: menu-complete")
+    except Exception:
+        pass
+    try:
+        readline.parse_and_bind("bind ^I rl_complete")
+    except Exception:
+        pass
+
 # 反馈检测关键词
 _FEEDBACK_KEYWORDS = {"不对", "错了", "不是", "应该", "缺少", "遗漏", "多了", "少了", "不要", "不能"}
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # ANSI 样式
 _BOLD = "\033[1m"
@@ -20,6 +91,88 @@ _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
 _RESET = "\033[0m"
+_HIDE_CURSOR = "\033[?25l"
+_SHOW_CURSOR = "\033[?25h"
+
+
+class Spinner:
+    """终端 spinner 动画，在后台线程中循环显示进度指示。
+
+    支持 pause/resume，在等待用户输入时暂停动画避免覆盖输入。
+
+    用法:
+        with Spinner("Thinking"):
+            await some_long_operation()
+    """
+
+    def __init__(self, message: str = "Thinking"):
+        self._message = message
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        sys.stdout.write(_HIDE_CURSOR)
+        sys.stdout.flush()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._paused.set()  # 解除 pause 阻塞，让线程能退出
+        if self._thread:
+            self._thread.join()
+        # 清除 spinner 行并恢复光标
+        sys.stdout.write(f"\r{' ' * (len(self._message) + 4)}\r")
+        sys.stdout.write(_SHOW_CURSOR)
+        sys.stdout.flush()
+        return False
+
+    def pause(self):
+        """暂停 spinner，清除当前行，恢复光标（用于等待用户输入）。"""
+        self._paused.set()
+        if self._thread:
+            self._thread.join(timeout=0.2)
+        sys.stdout.write(f"\r{' ' * (len(self._message) + 4)}\r")
+        sys.stdout.write(_SHOW_CURSOR)
+        sys.stdout.flush()
+
+    def resume(self):
+        """恢复 spinner 动画。"""
+        self._paused.clear()
+        sys.stdout.write(_HIDE_CURSOR)
+        sys.stdout.flush()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._stop.clear()
+        self._thread.start()
+
+    def _spin(self):
+        idx = 0
+        while not self._stop.is_set():
+            if self._paused.is_set():
+                return  # pause 时线程退出，resume 时新建
+            frame = _SPINNER_FRAMES[idx % len(_SPINNER_FRAMES)]
+            sys.stdout.write(f"\r {_CYAN}{frame}{_RESET} {self._message}")
+            sys.stdout.flush()
+            idx += 1
+            self._stop.wait(0.1)
+
+
+# 当前活跃的 spinner 实例（模块级，供 confirm 回调使用）
+_active_spinner: Spinner | None = None
+
+
+def _confirm_with_spinner(prompt: str) -> bool:
+    """确认回调：暂停 spinner → 等待用户输入 → 恢复 spinner。"""
+    if _active_spinner:
+        _active_spinner.pause()
+    try:
+        answer = input(f"   {prompt}").strip().lower()
+        return answer == "y"
+    finally:
+        if _active_spinner:
+            _active_spinner.resume()
 
 
 def _likely_feedback(text: str) -> bool:
@@ -45,7 +198,7 @@ def _build_welcome_message(businesses: list = None) -> str:
 Registered businesses:
 {biz_list}
 
-{_DIM}Slash commands:{_RESET}
+{_DIM}Slash commands (Tab to autocomplete):{_RESET}
   {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
   {_CYAN}/remove{_RESET} <name>                    Remove business
   {_CYAN}/list{_RESET}                             List businesses
@@ -53,12 +206,15 @@ Registered businesses:
   {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
   {_CYAN}/new{_RESET}                              Start new conversation
   {_CYAN}/pin{_RESET} <message>                     Pin important context (survives history compression)
+  {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
+  {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
+  {_CYAN}/fields{_RESET}                             List all field knowledge
 """
     description = businesses[0].display_name if businesses else "business"
     return f"""\
 {_BOLD}query-agent{_RESET} {_DIM}({description}){_RESET}
 
-{_DIM}Slash commands:{_RESET}
+{_DIM}Slash commands (Tab to autocomplete):{_RESET}
   {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
   {_CYAN}/remove{_RESET} <name>                    Remove business
   {_CYAN}/list{_RESET}                             List businesses
@@ -66,6 +222,9 @@ Registered businesses:
   {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
   {_CYAN}/new{_RESET}                              Start new conversation
   {_CYAN}/pin{_RESET} <message>                     Pin important context (survives history compression)
+  {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
+  {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
+  {_CYAN}/fields{_RESET}                             List all field knowledge
 """
 
 
@@ -146,6 +305,7 @@ def _handle_clear(agent: QueryAgent, args: list[str]) -> None:
 
 async def main(config_path: str = "./config.yaml") -> None:
     """异步主函数，运行交互式查询循环。"""
+    global _active_spinner
     config = load_config(config_path)
     businesses = []
     if config.businesses:
@@ -162,7 +322,9 @@ async def main(config_path: str = "./config.yaml") -> None:
 
     print(_build_welcome_message(businesses))
 
-    agent = QueryAgent(config_path=config_path)
+    _setup_readline()
+
+    agent = QueryAgent(config_path=config_path, confirm_callback=_confirm_with_spinner)
 
     last_query = ""
     last_response = ""
@@ -208,6 +370,56 @@ async def main(config_path: str = "./config.yaml") -> None:
                 print(f"  Usage: /pin <message>")
             continue
 
+        if cmd == "/field":
+            if len(parts) < 3:
+                print(f"  {_DIM}Usage: /field <table>.<column> <description>{_RESET}")
+                print(f"  {_DIM}Example: /field tb_voice.origin 1=自研,2=阿里云,3=腾讯云,5=火山引擎{_RESET}")
+                continue
+            field_key = parts[1]
+            if "." not in field_key:
+                print(f"  {_RED}Error:{_RESET} Field key must be in table.column format (e.g. tb_voice.origin)")
+                continue
+            table, column = field_key.split(".", 1)
+            description = " ".join(parts[2:])
+            agent.field_knowledge.add_field(table, column, description)
+            agent._mark_prompt_dirty()
+            print(f"  {_GREEN}Added field knowledge:{_RESET} {table}.{column}: {description}")
+            continue
+
+        if cmd == "/field_rm":
+            if len(parts) < 2:
+                print(f"  {_DIM}Usage: /field_rm <table>.<column>{_RESET}")
+                continue
+            field_key = parts[1]
+            if "." not in field_key:
+                print(f"  {_RED}Error:{_RESET} Field key must be in table.column format")
+                continue
+            table, column = field_key.split(".", 1)
+            removed = agent.field_knowledge.remove_field(table, column)
+            if removed:
+                agent._mark_prompt_dirty()
+                print(f"  {_GREEN}Removed:{_RESET} {table}.{column}")
+            else:
+                print(f"  {_YELLOW}Not found:{_RESET} {table}.{column}")
+            continue
+
+        if cmd == "/fields":
+            entries = agent.field_knowledge.get_entries()
+            if not entries:
+                print(f"  {_DIM}No field knowledge recorded.{_RESET}")
+            else:
+                # 按表分组显示
+                table_groups: dict[str, list] = {}
+                for e in entries:
+                    if e.table not in table_groups:
+                        table_groups[e.table] = []
+                    table_groups[e.table].append(e)
+                for table, fields in sorted(table_groups.items()):
+                    print(f"\n  {_BOLD}{table}{_RESET}:")
+                    for f in fields:
+                        print(f"    {f.column}: {f.description}")
+            continue
+
         if cmd == "/add":
             await _handle_add(agent, parts[1:])
             continue
@@ -223,11 +435,15 @@ async def main(config_path: str = "./config.yaml") -> None:
         # 检测用户反馈：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
         # 反馈只记录经验，不触发查询
         if last_query and last_response and _likely_feedback(user_input):
-            feedback_lesson = await agent.extract_feedback_lesson(
-                original_query=last_query,
-                agent_response=last_response,
-                user_feedback=user_input,
-            )
+            spinner = Spinner("Analyzing feedback")
+            _active_spinner = spinner
+            with spinner:
+                feedback_lesson = await agent.extract_feedback_lesson(
+                    original_query=last_query,
+                    agent_response=last_response,
+                    user_feedback=user_input,
+                )
+            _active_spinner = None
             if feedback_lesson:
                 business = agent._last_query_context.get("business", "") if agent._last_query_context else ""
                 agent.error_memory.add_error(
@@ -245,7 +461,11 @@ async def main(config_path: str = "./config.yaml") -> None:
 
         # 正常查询流程
         try:
-            response = await agent.run_query(user_input)
+            spinner = Spinner("Thinking")
+            _active_spinner = spinner
+            with spinner:
+                response = await agent.run_query(user_input)
+            _active_spinner = None
             print(f"\n{response}")
 
             # 展示查询元信息
