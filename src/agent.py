@@ -632,7 +632,14 @@ class QueryAgent:
                 # 执行前检查（打印 SQL、性能风险检测、用户确认）
                 cancel_result = await self._pre_execute_check(tc.name, tc.arguments)
                 if cancel_result is not None:
-                    result_text = cancel_result
+                    # 用户拒绝执行，直接中断对话循环
+                    self._conversation_history.append(
+                        {"role": "user", "content": user_input}
+                    )
+                    self._conversation_history.append(
+                        {"role": "assistant", "content": "查询已被用户取消。"}
+                    )
+                    return "查询已被用户取消。"
                 else:
                     result_text, resolved_business = await execute_tool(tc.name, tc.arguments, tc_business)
                     if not tc_business and resolved_business:

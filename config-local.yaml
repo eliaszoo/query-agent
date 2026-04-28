@@ -48,8 +48,8 @@ agent:
 businesses:
   digitalhuman:
     display_name: "数字人"
-    mcp_server_url: "${MCP_SERVER_URL}"
-    api_key: "${MCP_API_KEY}"  # 与 MCP Server 共享的鉴权密钥
+    mcp_server_url: "${DH_MCP_SERVER_URL}"
+    api_key: "${DH_MCP_API_KEY}"  # 与 MCP Server 共享的鉴权密钥
   # 添加更多业务：
   # order:
   #   display_name: "订单"

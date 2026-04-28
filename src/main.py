@@ -221,14 +221,29 @@ async def main(config_path: str = "./config.yaml") -> None:
             continue
 
         # 检测用户反馈：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
-        feedback_lesson = None
+        # 反馈只记录经验，不触发查询
         if last_query and last_response and _likely_feedback(user_input):
             feedback_lesson = await agent.extract_feedback_lesson(
                 original_query=last_query,
                 agent_response=last_response,
                 user_feedback=user_input,
             )
+            if feedback_lesson:
+                business = agent._last_query_context.get("business", "") if agent._last_query_context else ""
+                agent.error_memory.add_error(
+                    user_query=last_query,
+                    error_type="USER_FEEDBACK",
+                    business=business,
+                    error_message=user_input,
+                    lesson=feedback_lesson,
+                )
+                agent._mark_prompt_dirty()
+                print(f"  {_YELLOW}Saved lesson:{_RESET} {feedback_lesson}")
+            else:
+                print(f"  {_DIM}No actionable lesson extracted from feedback.{_RESET}")
+            continue
 
+        # 正常查询流程
         try:
             response = await agent.run_query(user_input)
             print(f"\n{response}")
@@ -241,18 +256,6 @@ async def main(config_path: str = "./config.yaml") -> None:
                     f"{m.input_tokens}+ {m.output_tokens}- | "
                     f"{m.tool_calls} tool calls){_RESET}"
                 )
-
-            # 保存反馈经验
-            if feedback_lesson:
-                business = agent._last_query_context.get("business", "") if agent._last_query_context else ""
-                agent.error_memory.add_error(
-                    user_query=last_query,
-                    error_type="USER_FEEDBACK",
-                    business=business,
-                    error_message=user_input,
-                    lesson=feedback_lesson,
-                )
-                print(f"  {_YELLOW}Saved lesson:{_RESET} {feedback_lesson}")
 
             last_query = user_input
             last_response = response

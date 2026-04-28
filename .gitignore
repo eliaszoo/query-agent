@@ -19,3 +19,5 @@ error_memory.json
 
 # claude
 .claude/
+
+env
