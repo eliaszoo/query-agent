@@ -1016,3 +1016,124 @@ agent:
 
     def test_extract_text_from_empty(self):
         assert QueryAgent._extract_text_from_content(None) == ""
+
+
+class TestFieldKnowledgeAutoExtract:
+    """字段含义自动提取测试。"""
+
+    def _make_agent(self, tmp_path):
+        """创建带 field_knowledge 的 agent（使用临时目录避免文件污染）。"""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+        agent._indexes_loaded = True
+        # 使用临时目录的 field_knowledge 文件，避免测试间共享
+        fk_path = str(tmp_path / "field_knowledge.json")
+        from src.field_knowledge import FieldKnowledgeManager
+        agent.field_knowledge = FieldKnowledgeManager(knowledge_path=fk_path)
+        return agent
+
+    def test_parse_enum_values(self):
+        """解析括号枚举格式。"""
+        result = QueryAgent._parse_enum_values("1(自研), 2(阿里云), 3(腾讯云)")
+        assert result == "1=自研, 2=阿里云, 3=腾讯云"
+
+    def test_parse_eq_values(self):
+        """解析等号枚举格式。"""
+        result = QueryAgent._parse_eq_values("5 = 火山, 1 = 正常, 2 = 禁用")
+        assert result == "5=火山, 1=正常, 2=禁用"
+
+    def test_infer_table_from_sql(self):
+        """从 SQL 推断表名。"""
+        assert QueryAgent._infer_table_from_sql("SELECT * FROM tb_voice WHERE id=1") == "tb_voice"
+        assert QueryAgent._infer_table_from_sql("") == ""
+        assert QueryAgent._infer_table_from_sql("SELECT 1") == ""
+
+    def test_structured_field_knowledge_tag(self, tmp_path):
+        """结构化 HTML 注释声明：优先解析。"""
+        agent = self._make_agent(tmp_path)
+        response = (
+            "查询结果：...\n\n"
+            '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山,1=自研,2=阿里云"},'
+            '{"table":"tb_voice","field":"forbidden_status","values":"1=正常,2=禁用"}] -->'
+        )
+        agent._auto_extract_field_knowledge(response)
+        entries = agent.field_knowledge.get_entries()
+        assert any(e.table == "tb_voice" and e.column == "origin" and "5=火山" in e.description for e in entries)
+        assert any(e.table == "tb_voice" and e.column == "forbidden_status" and "1=正常" in e.description for e in entries)
+
+    def test_structured_tag_strips_from_display(self, tmp_path):
+        """结构化注释从展示文本中剥离。"""
+        import re
+        tag_pattern = QueryAgent._FIELD_KNOWLEDGE_TAG
+        response = (
+            "查询结果：42\n"
+            '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山"}] -->'
+        )
+        display = tag_pattern.sub('', response).rstrip()
+        assert "FIELD_KNOWLEDGE" not in display
+        assert "查询结果：42" in display
+
+    def test_fallback_field_eq_pattern(self, tmp_path):
+        """回退模式: **来源(origin)**: 5 = 火山。"""
+        agent = self._make_agent(tmp_path)
+        agent._last_query_context = {"sql": "SELECT origin FROM tb_voice WHERE deleted_at IS NULL"}
+        response = "- **来源(origin)**: 5 = 火山\n- **可见性(visibility)**: 1 = 公用"
+        agent._auto_extract_field_knowledge(response)
+        entries = agent.field_knowledge.get_entries()
+        assert any(e.column == "origin" and "5=火山" in e.description for e in entries)
+        assert any(e.column == "visibility" and "1=公用" in e.description for e in entries)
+
+    def test_fallback_field_enum_pattern(self, tmp_path):
+        """回退模式: origin: 1(自研), 2(阿里云) — 需 SQL 推断表名。"""
+        agent = self._make_agent(tmp_path)
+        agent._last_query_context = {"sql": "SELECT * FROM tb_voice"}
+        response = "origin: 1(自研), 2(阿里云), 3(腾讯云)"
+        agent._auto_extract_field_knowledge(response)
+        entries = agent.field_knowledge.get_entries()
+        assert any(e.table == "tb_voice" and e.column == "origin" for e in entries)
+
+    def test_fallback_table_field_enum_pattern(self, tmp_path):
+        """回退模式: tb_voice.origin: 1(自研), 2(阿里云) — 直接提取。"""
+        agent = self._make_agent(tmp_path)
+        response = "tb_voice.origin: 1(自研), 2(阿里云)"
+        agent._auto_extract_field_knowledge(response)
+        entries = agent.field_knowledge.get_entries()
+        assert any(e.table == "tb_voice" and e.column == "origin" and "1=自研" in e.description for e in entries)
+
+    def test_no_extract_without_sql_for_fallback(self, tmp_path):
+        """回退模式无 SQL 上下文时不提取。"""
+        agent = self._make_agent(tmp_path)
+        agent._last_query_context = {}
+        response = "origin: 1(自研), 2(阿里云)"
+        agent._auto_extract_field_knowledge(response)
+        entries = agent.field_knowledge.get_entries()
+        assert not any(e.column == "origin" for e in entries)
+
+    def test_mark_prompt_dirty_on_extract(self, tmp_path):
+        """提取字段知识后标记 prompt 需重建。"""
+        agent = self._make_agent(tmp_path)
+        agent._cached_system_prompt = "old prompt"
+        agent._prompt_dirty = False
+        response = '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山"}] -->'
+        agent._auto_extract_field_knowledge(response)
+        assert agent._prompt_dirty is True
+        response = "tb_voice.origin: 5 = 火山"
+        agent._auto_extract_field_knowledge(response)
+        assert agent._prompt_dirty is True

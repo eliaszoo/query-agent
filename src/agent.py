@@ -621,7 +621,13 @@ class QueryAgent:
             metrics.output_tokens += response.output_tokens
 
             if response.stop_reason == "end_turn":
-                # 保存到对话历史
+                # 提取字段含义（在剥离注释前）
+                self._auto_extract_field_knowledge(response.text)
+
+                # 剥离 FIELD_KNOWLEDGE 注释，不展示给用户
+                display_text = self._FIELD_KNOWLEDGE_TAG.sub('', response.text).rstrip()
+
+                # 保存到对话历史（保留注释供后续提取）
                 self._conversation_history.append(
                     {"role": "user", "content": user_input}
                 )
@@ -629,10 +635,7 @@ class QueryAgent:
                     {"role": "assistant", "content": response.text}
                 )
 
-                # 自动提取回复中明确标注的字段含义并持久化
-                self._auto_extract_field_knowledge(response.text)
-
-                return response.text
+                return display_text
 
             # 处理工具调用
             messages.append(
@@ -871,28 +874,83 @@ class QueryAgent:
             logger.debug("提取反馈经验失败", exc_info=True)
             return None
 
-    # 字段含义自动提取的正则：匹配 "字段名(枚举值)" 模式
-    # 如: origin: 1(自研), 2(阿里云)  或  forbidden_status: 1(正常), 2(禁用)
-    _FIELD_ENUM_PATTERN = _re.compile(
-        r'(\w+)\s*[：:]\s*'           # 字段名 + 冒号
-        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',  # 1(自研), 2(阿里云), ...
+    # 字段含义自动提取的正则
+    # 模式1: "tb_voice.origin: 1(自研), 2(阿里云)" — 表名.字段名 + 括号枚举
+    _TABLE_FIELD_PATTERN = _re.compile(
+        r'(tb_\w+)\.(\w+)\s*[：:]\s*'
+        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',
         _re.UNICODE
     )
-    _TABLE_FIELD_PATTERN = _re.compile(        r'(tb_\w+)\.(\w+)\s*[：:]\s*'  # tb_voice.origin:
-        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',  # 枚举值
+    # 模式2: "origin: 1(自研), 2(阿里云)" — 字段名 + 括号枚举（需从 SQL 推断表名）
+    _FIELD_ENUM_PATTERN = _re.compile(
+        r'(\w+)\s*[：:]\s*'
+        r'((?:\d+\s*[（(]\s*[^）)]+\s*[）)]\s*[，,]?\s*)+)',
+        _re.UNICODE
+    )
+    # 模式3: "**来源(origin)**: 5 = 火山" 或 "禁用状态(forbidden_status): 1 = 正常, 2 = 禁用"
+    # — 中文名(字段名): 数字 = 含义（支持 markdown ** 粗体）
+    _FIELD_EQ_PATTERN = _re.compile(
+        r'\*{0,2}(?:\S+?\s*)?\((\w+)\)\*{0,2}\s*[：:]\s*'  # **中文(field_name)**:
+        r'((?:\d+\s*=\s*[^,，\n]+(?:\s*[，,]\s*|\s*))+)',   # 5 = 火山, 1 = 正常, 2 = 禁用
+        _re.UNICODE
+    )
+
+        # HTML 注释中的结构化字段知识声明
+    # 格式: <!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山,1=自研"}] -->
+    _FIELD_KNOWLEDGE_TAG = _re.compile(
+        r'<!--\s*FIELD_KNOWLEDGE:\s*(\[[\s\S]*?\])\s*-->',
         _re.UNICODE
     )
 
     def _auto_extract_field_knowledge(self, response_text: str) -> None:
-        """从 LLM 回复中自动提取字段含义并持久化到 field_knowledge。
+        """从 LLM 回复中提取字段含义并持久化到 field_knowledge。
 
-        匹配两种模式:
-        1. "tb_voice.origin: 1(自研), 2(阿里云)" → 直接提取
-        2. "origin: 1(自研), 2(阿里云)" → 需结合 SQL 中的表名
+        优先解析结构化 HTML 注释声明：
+          <!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山,1=自研"}] -->
+
+        若无结构化声明，回退到正则匹配自由文本中的字段含义。
         """
         dirty = False
 
-        # 模式1: 表名.字段名: 枚举值
+        # 优先：结构化 HTML 注释
+        for match in self._FIELD_KNOWLEDGE_TAG.finditer(response_text):
+            try:
+                items = _json.loads(match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                items = []
+            for item in items:
+                table = item.get("table", "")
+                field = item.get("field", "")
+                values = item.get("values", "")
+                if table and field and values:
+                    self.field_knowledge.add_field(table, field, values)
+                    dirty = True
+                    logger.info("提取字段知识(结构化): %s.%s: %s", table, field, values)
+            if dirty:
+                self._mark_prompt_dirty()
+                return  # 结构化声明已处理，无需回退
+
+        # 回退：正则匹配自由文本
+        self._auto_extract_field_knowledge_fallback(response_text)
+
+    def _auto_extract_field_knowledge_fallback(self, response_text: str) -> None:
+        """回退：从自由文本中正则匹配字段含义。"""
+        dirty = False
+        sql = (self._last_query_context or {}).get("sql", "")
+
+        # 模式: 中文名(字段名): 数字 = 含义  — 如 **来源(origin)**: 5 = 火山
+        for match in self._FIELD_EQ_PATTERN.finditer(response_text):
+            column = match.group(1)
+            raw_values = match.group(2)
+            description = self._parse_eq_values(raw_values)
+            if description:
+                table = self._infer_table_from_sql(sql)
+                if table:
+                    self.field_knowledge.add_field(table, column, description)
+                    dirty = True
+                    logger.info("提取字段知识(回退): %s.%s: %s", table, column, description)
+
+        # 模式: 表名.字段名: 括号枚举 — 如 tb_voice.origin: 1(自研), 2(阿里云)
         for match in self._TABLE_FIELD_PATTERN.finditer(response_text):
             table = match.group(1)
             column = match.group(2)
@@ -901,32 +959,44 @@ class QueryAgent:
             if description:
                 self.field_knowledge.add_field(table, column, description)
                 dirty = True
-                logger.info("自动提取字段知识: %s.%s: %s", table, column, description)
+                logger.info("提取字段知识(回退): %s.%s: %s", table, column, description)
 
-        # 模式2: 字段名: 枚举值（无表名前缀，从最近 SQL 上下文推断表名）
-        if not dirty and self._last_query_context:
-            sql = self._last_query_context.get("sql", "")
-            if sql:
-                # 从 SQL 中提取表名
-                table_match = _re.search(r'FROM\s+(tb_\w+)', sql, _re.IGNORECASE)
-                if table_match:
-                    table = table_match.group(1)
-                    for match in self._FIELD_ENUM_PATTERN.finditer(response_text):
-                        column = match.group(1)
-                        raw_values = match.group(2)
-                        description = self._parse_enum_values(raw_values)
-                        if description and not column.startswith('tb_'):
-                            self.field_knowledge.add_field(table, column, description)
-                            dirty = True
-                            logger.info("自动提取字段知识: %s.%s: %s", table, column, description)
+        # 模式: 字段名: 括号枚举 — 如 origin: 1(自研), 2(阿里云)
+        if not dirty:
+            for match in self._FIELD_ENUM_PATTERN.finditer(response_text):
+                column = match.group(1)
+                raw_values = match.group(2)
+                description = self._parse_enum_values(raw_values)
+                if description and not column.startswith('tb_'):
+                    table = self._infer_table_from_sql(sql)
+                    if table:
+                        self.field_knowledge.add_field(table, column, description)
+                        dirty = True
+                        logger.info("提取字段知识(回退): %s.%s: %s", table, column, description)
 
         if dirty:
             self._mark_prompt_dirty()
 
     @staticmethod
+    def _infer_table_from_sql(sql: str) -> str:
+        """从 SQL 中提取表名，优先取 FROM 子句中的 tb_ 表。"""
+        if not sql:
+            return ""
+        table_match = _re.search(r'FROM\s+(tb_\w+)', sql, _re.IGNORECASE)
+        return table_match.group(1) if table_match else ""
+
+    @staticmethod
     def _parse_enum_values(raw: str) -> str:
         """解析 "1(自研), 2(阿里云), 3(腾讯云)" 格式为 "1=自研, 2=阿里云, 3=腾讯云"。"""
         parts = _re.findall(r'(\d+)\s*[（(]\s*([^）)]+)\s*[）)]', raw)
+        if not parts:
+            return ""
+        return ", ".join(f"{num}={label.strip()}" for num, label in parts)
+
+    @staticmethod
+    def _parse_eq_values(raw: str) -> str:
+        """解析 "5 = 火山, 1 = 正常, 2 = 禁用" 格式为 "5=火山, 1=正常, 2=禁用"。"""
+        parts = _re.findall(r'(\d+)\s*=\s*([^,，\n]+)', raw)
         if not parts:
             return ""
         return ", ".join(f"{num}={label.strip()}" for num, label in parts)

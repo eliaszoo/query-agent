@@ -69,6 +69,9 @@ def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None =
     parts.append("4. 默认查询测试集群，用户明确指定时才查询生产集群")
     parts.append("5. 注意 deleted_at IS NULL 条件过滤已删除数据")
     parts.append("6. 结果以表格形式呈现，附带中文字段说明")
+    parts.append("7. 回复末尾用 HTML 注释声明字段含义，格式：")
+    parts.append("   <!-- FIELD_KNOWLEDGE: [{\"table\":\"tb_xxx\",\"field\":\"yyy\",\"values\":\"1=正常,2=禁用\"}] -->")
+    parts.append("   仅声明枚举/状态类字段，普通字段无需声明。table 取自 SQL 的 FROM 表名。")
 
     if bk.custom_rules:
         for i, rule in enumerate(bk.custom_rules, 7):
@@ -142,5 +145,8 @@ def _build_multi_business_prompt(
     parts.append("4. 默认查询测试集群，用户明确指定时才查询生产集群")
     parts.append("5. 注意 deleted_at IS NULL 条件过滤已删除数据")
     parts.append("6. 结果以表格形式呈现，附带中文字段说明")
+    parts.append("7. 回复末尾用 HTML 注释声明字段含义，格式：")
+    parts.append("   <!-- FIELD_KNOWLEDGE: [{\"table\":\"tb_xxx\",\"field\":\"yyy\",\"values\":\"1=正常,2=禁用\"}] -->")
+    parts.append("   仅声明枚举/状态类字段，普通字段无需声明。table 取自 SQL 的 FROM 表名。")
 
     return "\n".join(parts)
