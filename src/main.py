@@ -210,9 +210,8 @@ Registered businesses:
   {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
   {_CYAN}/fields{_RESET}                             List all field knowledge
 """
-    description = businesses[0].display_name if businesses else "business"
     return f"""\
-{_BOLD}query-agent{_RESET} {_DIM}({description}){_RESET}
+{_BOLD}query-agent{_RESET}
 
 {_DIM}Slash commands (Tab to autocomplete):{_RESET}
   {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
