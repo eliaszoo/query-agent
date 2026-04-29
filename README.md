@@ -187,6 +187,49 @@ businesses:
 | `/fields` | 列出所有字段知识 |
 | `exit` / `quit` / `q` | 退出 |
 
+## MCP Server 安全机制
+
+MCP Server 以 SSE 模式暴露在网络上时，有多层安全防护：
+
+### 1. Bearer Token 鉴权
+
+SSE 模式下所有 HTTP/WebSocket 请求必须携带 `Authorization: Bearer <api_key>`，否则返回 401/403。
+
+API Key 配置（优先级从高到低）：
+
+| 来源 | 配置方式 |
+|------|---------|
+| 配置文件 | `auth.api_key: "your-secret"` |
+| 环境变量 | `export MCP_API_KEY=your-secret` |
+
+未配置 API Key 时，SSE 模式启动会打印警告，**所有请求无鉴权放行**（仅建议内网使用）。
+
+Agent 侧在 `businesses` 配置中传入 `api_key`，连接时自动附加到请求头。
+
+Token 比对使用 `secrets.compare_digest()`，防止时序攻击。
+
+### 2. SQL 安全校验
+
+每条 SQL 在执行前经过完整的验证管道（见 SQL 安全管道章节），确保只读、白名单表、强制 LIMIT。
+
+### 3. 表名校验
+
+`get_table_schema`、`get_table_indexes` 等工具的 `table_name` 参数经过正则校验 `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`，防止反引号逃逸等 SQL 注入。白名单外的表直接拒绝。
+
+### 4. 查询超时
+
+每条 SQL 执行前自动设置 `SET SESSION MAX_EXECUTION_TIME = <timeout_ms>`，防止慢查询占用连接。超时时间通过 `sql_security.query_timeout`（秒）配置。
+
+### 5. 连接安全
+
+- 数据库连接使用 `readonly_user` + `autocommit=True`，确保无事务锁
+- 连接池按集群隔离，互不影响
+- 初始化使用 double-check locking 防止并发重复建池
+
+### 6. stdio 模式免鉴权
+
+stdio 模式下 MCP Server 作为本地子进程运行，通过 stdin/stdout 通信，无需网络鉴权。
+
 ## SQL 安全管道
 
 每条 SQL 经过以下检查链：
