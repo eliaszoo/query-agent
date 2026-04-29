@@ -11,8 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.agent import QueryAgent, _convert_mcp_tools_to_anthropic, _merge_tools_with_business_param
+from src.agent import QueryAgent, QueryMetrics, _convert_mcp_tools_to_anthropic, _merge_tools_with_business_param
+from src.business_selection_service import BusinessSelectionService
+from src.conversation_state import ConversationState
 from src.error_memory import ErrorMemoryManager
+from src.knowledge_store import KnowledgeStore
+from src.tool_execution_service import ToolExecutionService
 
 
 # ---------------------------------------------------------------------------
@@ -146,18 +150,18 @@ class TestSerializeToolResult:
     def test_text_content(self):
         result = MagicMock()
         result.content = [FakeToolResultContent(text='{"success": true}')]
-        assert QueryAgent._serialize_tool_result(result) == '{"success": true}'
+        assert ToolExecutionService.serialize_tool_result(result) == '{"success": true}'
 
     def test_no_text_attr_falls_back_to_str(self):
         item = 42  # no .text attribute
         result = MagicMock()
         result.content = [item]
-        assert QueryAgent._serialize_tool_result(result) == "42"
+        assert ToolExecutionService.serialize_tool_result(result) == "42"
 
     def test_empty_content(self):
         result = MagicMock()
         result.content = []
-        assert QueryAgent._serialize_tool_result(result) == ""
+        assert ToolExecutionService.serialize_tool_result(result) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +226,55 @@ businesses:
         names = {e.name for e in entries}
         assert "digitalhuman" in names
         assert "order" in names
+
+    def test_init_uses_derived_storage_namespace(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "claude-sonnet-4-20250514"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        assert ".query-agent" in agent._knowledge_store.error_memory._path
+        assert agent._storage_namespace in agent._knowledge_store.error_memory._path
+        assert agent._storage_namespace in agent._knowledge_store.field_knowledge._path
+
+    def test_init_uses_explicit_storage_namespace(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+storage:
+  namespace: "prod-order"
+agent:
+  model: "claude-sonnet-4-20250514"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        assert agent._storage_namespace == "prod-order"
+        assert "prod-order" in agent._knowledge_store.error_memory._path
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +407,7 @@ agent:
         from src.llm_provider import LLMResponse, ToolCall
 
         # 跳过索引加载
-        agent._indexes_loaded = True
+        agent._tool_execution.indexes_loaded = True
 
         # First response: tool_use
         resp1 = LLMResponse(
@@ -431,7 +484,7 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        result = await agent._pre_execute_check(
+        result = await agent._tool_execution.pre_execute_check(
             "get_cluster_list", {"cluster": "test"}
         )
         assert result is None
@@ -463,12 +516,12 @@ agent:
 
         # 注入索引信息使 SQL 有风险
         from src.sql_risk_checker import IndexInfo
-        agent._risk_checker.update_indexes("tb_scene", [
+        agent._risk_checker.update_indexes("default", "test", "tb_scene", [
             IndexInfo(table="tb_scene", name="PRIMARY", columns=["id"], unique=True, index_type="BTREE"),
         ])
-        agent._indexes_loaded = True
+        agent._tool_execution.indexes_loaded = True
 
-        result = await agent._pre_execute_check(
+        result = await agent._tool_execution.pre_execute_check(
             "execute_readonly_sql",
             {"cluster": "test", "sql": "SELECT * FROM tb_scene"},
         )
@@ -501,12 +554,12 @@ agent:
             agent = QueryAgent(config_path=str(config_file), confirm_callback=lambda _: True)
 
         from src.sql_risk_checker import IndexInfo
-        agent._risk_checker.update_indexes("tb_scene", [
+        agent._risk_checker.update_indexes("default", "test", "tb_scene", [
             IndexInfo(table="tb_scene", name="PRIMARY", columns=["id"], unique=True, index_type="BTREE"),
         ])
-        agent._indexes_loaded = True
+        agent._tool_execution.indexes_loaded = True
 
-        result = await agent._pre_execute_check(
+        result = await agent._tool_execution.pre_execute_check(
             "execute_readonly_sql",
             {"cluster": "test", "sql": "SELECT * FROM tb_scene"},
         )
@@ -544,12 +597,12 @@ agent:
             agent = QueryAgent(config_path=str(config_file), confirm_callback=track_confirm)
 
         from src.sql_risk_checker import IndexInfo
-        agent._risk_checker.update_indexes("tb_scene", [
+        agent._risk_checker.update_indexes("default", "test", "tb_scene", [
             IndexInfo(table="tb_scene", name="PRIMARY", columns=["id"], unique=True, index_type="BTREE"),
         ])
-        agent._indexes_loaded = True
+        agent._tool_execution.indexes_loaded = True
 
-        result = await agent._pre_execute_check(
+        result = await agent._tool_execution.pre_execute_check(
             "execute_readonly_sql",
             {"cluster": "test", "sql": "SELECT id FROM tb_scene WHERE id = 1"},
         )
@@ -578,9 +631,9 @@ businesses:
             agent = QueryAgent(config_path=str(config_file))
 
         # 使用临时目录避免测试间共享 error_memory
-        agent.error_memory = ErrorMemoryManager(
+        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
-        )
+        ))
 
         import json
         result_text = json.dumps({
@@ -589,15 +642,15 @@ businesses:
             "error_message": "表 xxx 不在白名单中",
         })
 
-        agent._check_and_record_error(
+        agent._knowledge_store.check_and_record_error(
             user_query="查数字人",
-            tool_name="execute_readonly_sql",
             tool_input={"business": "digitalhuman", "sql": "SELECT * FROM xxx"},
             result_text=result_text,
             business="digitalhuman",
+            lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.error_memory.get_entries()
+        entries = agent.get_error_memory_entries()
         assert len(entries) == 1
         assert entries[0].business == "digitalhuman"
 
@@ -624,9 +677,9 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        agent.error_memory = ErrorMemoryManager(
+        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
-        )
+        ))
 
         import json
         result_text = json.dumps({
@@ -635,14 +688,15 @@ agent:
             "error_message": "包含写操作",
         })
 
-        agent._check_and_record_error(
+        agent._knowledge_store.check_and_record_error(
             user_query="查数据",
-            tool_name="execute_readonly_sql",
             tool_input={"sql": "DELETE FROM tb_scene"},
             result_text=result_text,
+            is_stdio_mode=agent._is_stdio_mode,
+            lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.error_memory.get_entries()
+        entries = agent.get_error_memory_entries()
         assert len(entries) == 1
         assert entries[0].business == "default"
 
@@ -676,9 +730,9 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent.error_memory = ErrorMemoryManager(
+        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
-        )
+        ))
 
         import json
         result_text = json.dumps({
@@ -687,14 +741,14 @@ agent:
             "error_message": "集群 'test' 连接失败",
         })
 
-        agent._check_and_record_error(
+        agent._knowledge_store.check_and_record_error(
             user_query="查数据",
-            tool_name="execute_readonly_sql",
             tool_input={"sql": "SELECT 1"},
             result_text=result_text,
+            lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.error_memory.get_entries()
+        entries = agent.get_error_memory_entries()
         assert len(entries) == 0
 
     async def test_config_error_not_recorded(self, tmp_path):
@@ -719,9 +773,9 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent.error_memory = ErrorMemoryManager(
+        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
-        )
+        ))
 
         import json
         result_text = json.dumps({
@@ -730,14 +784,14 @@ agent:
             "error_message": "环境变量未设置",
         })
 
-        agent._check_and_record_error(
+        agent._knowledge_store.check_and_record_error(
             user_query="查数据",
-            tool_name="execute_readonly_sql",
             tool_input={"sql": "SELECT 1"},
             result_text=result_text,
+            lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.error_memory.get_entries()
+        entries = agent.get_error_memory_entries()
         assert len(entries) == 0
 
     async def test_query_error_not_recorded(self, tmp_path):
@@ -762,9 +816,9 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent.error_memory = ErrorMemoryManager(
+        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
-        )
+        ))
 
         import json
         result_text = json.dumps({
@@ -773,18 +827,26 @@ agent:
             "error_message": "语法错误",
         })
 
-        agent._check_and_record_error(
+        agent._knowledge_store.check_and_record_error(
             user_query="查数据",
-            tool_name="execute_readonly_sql",
             tool_input={"sql": "SELECT name FROM tb_scene"},
             result_text=result_text,
+            lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.error_memory.get_entries()
+        entries = agent.get_error_memory_entries()
         assert len(entries) == 0
 
 
 class TestExtractFeedbackLesson:
+    def test_extract_explicit_feedback_lesson_for_available_data_rule(self):
+        lesson = QueryAgent.extract_explicit_feedback_lesson("记住，后续查询默认只查可用的数据")
+        assert lesson == "默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。"
+
+    def test_extract_explicit_feedback_lesson_returns_none_for_plain_query(self):
+        lesson = QueryAgent.extract_explicit_feedback_lesson("帮我查两个公共音色")
+        assert lesson is None
+
     async def test_returns_none_for_new_query(self, tmp_path):
         """当用户输入是新查询时返回 None。"""
         config_file = tmp_path / "config.yaml"
@@ -901,7 +963,7 @@ class TestSummarizeToolResult:
                  "default": "", "extra": ""},
             ],
         })
-        result = QueryAgent._summarize_tool_result("get_table_schema", result_text)
+        result = ToolExecutionService.summarize_tool_result("get_table_schema", result_text)
         data = json.loads(result)
         for col in data["columns"]:
             assert "default" not in col
@@ -918,7 +980,7 @@ class TestSummarizeToolResult:
             "row_count": 20,
             "truncated": False,
         })
-        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        result = ToolExecutionService.summarize_tool_result("execute_readonly_sql", result_text)
         data = json.loads(result)
         assert len(data["rows"]) == 10
         assert data["row_count"] == 20
@@ -934,18 +996,18 @@ class TestSummarizeToolResult:
             "row_count": 5,
             "truncated": False,
         })
-        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        result = ToolExecutionService.summarize_tool_result("execute_readonly_sql", result_text)
         data = json.loads(result)
         assert len(data["rows"]) == 5
         assert "note" not in data
 
     def test_error_result_passthrough(self):
         result_text = json.dumps({"success": False, "error_type": "CONNECTION_ERROR", "error_message": "fail"})
-        result = QueryAgent._summarize_tool_result("execute_readonly_sql", result_text)
+        result = ToolExecutionService.summarize_tool_result("execute_readonly_sql", result_text)
         assert result == result_text
 
     def test_non_json_passthrough(self):
-        result = QueryAgent._summarize_tool_result("execute_readonly_sql", "not json")
+        result = ToolExecutionService.summarize_tool_result("execute_readonly_sql", "not json")
         assert result == "not json"
 
 
@@ -974,7 +1036,7 @@ agent:
     def test_short_history_not_compressed(self, tmp_path):
         agent = self._make_agent(tmp_path)
         # 6 messages = 3 turns, should not compress
-        agent._conversation_history = [
+        agent._conversation.history = [
             {"role": "user", "content": "q1"},
             {"role": "assistant", "content": "a1"},
             {"role": "user", "content": "q2"},
@@ -982,8 +1044,8 @@ agent:
             {"role": "user", "content": "q3"},
             {"role": "assistant", "content": "a3"},
         ]
-        agent._trim_history()
-        assert len(agent._conversation_history) == 6
+        agent._conversation.trim_history()
+        assert len(agent._conversation.history) == 6
 
     def test_long_history_compresses_older(self, tmp_path):
         agent = self._make_agent(tmp_path)
@@ -992,30 +1054,30 @@ agent:
         for i in range(1, 6):
             history.append({"role": "user", "content": f"query {i}"})
             history.append({"role": "assistant", "content": f"answer {i}"})
-        agent._conversation_history = history
-        agent._trim_history()
+        agent._conversation.history = history
+        agent._conversation.trim_history()
 
         # Recent 3 turns (6 messages) should be intact
-        recent = agent._conversation_history[-6:]
+        recent = agent._conversation.history[-6:]
         assert recent[0]["content"] == "query 3"
         assert recent[1]["content"] == "answer 3"
 
         # Older turns should be compressed (only user + [历史] assistant)
-        older = agent._conversation_history[:-6]
+        older = agent._conversation.history[:-6]
         assert any("[历史]" in m.get("content", "") for m in older)
 
     def test_extract_text_from_string_content(self):
-        assert QueryAgent._extract_text_from_content("hello") == "hello"
+        assert ConversationState.extract_text_from_content("hello") == "hello"
 
     def test_extract_text_from_block_list(self):
         content = [
             {"type": "text", "text": "hello "},
             {"type": "text", "text": "world"},
         ]
-        assert QueryAgent._extract_text_from_content(content) == "hello \nworld"
+        assert ConversationState.extract_text_from_content(content) == "hello \nworld"
 
     def test_extract_text_from_empty(self):
-        assert QueryAgent._extract_text_from_content(None) == ""
+        assert ConversationState.extract_text_from_content(None) == ""
 
 
 class TestFieldKnowledgeAutoExtract:
@@ -1042,28 +1104,38 @@ agent:
         )
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent._indexes_loaded = True
+        agent._tool_execution.indexes_loaded = True
         # 使用临时目录的 field_knowledge 文件，避免测试间共享
         fk_path = str(tmp_path / "field_knowledge.json")
         from src.field_knowledge import FieldKnowledgeManager
-        agent.field_knowledge = FieldKnowledgeManager(knowledge_path=fk_path)
+        field_knowledge = FieldKnowledgeManager(knowledge_path=fk_path)
+        agent._knowledge_store.set_field_knowledge(field_knowledge)
+        agent._tool_execution.set_field_knowledge_manager(field_knowledge)
         return agent
+
+    @staticmethod
+    def _extract(agent: QueryAgent, response_text: str) -> None:
+        agent._knowledge_store.auto_extract_field_knowledge(
+            response_text=response_text,
+            business=agent.get_last_business(),
+            sql=(agent._conversation.last_query_context or {}).get("sql", ""),
+        )
 
     def test_parse_enum_values(self):
         """解析括号枚举格式。"""
-        result = QueryAgent._parse_enum_values("1(自研), 2(阿里云), 3(腾讯云)")
+        result = KnowledgeStore.parse_enum_values("1(自研), 2(阿里云), 3(腾讯云)")
         assert result == "1=自研, 2=阿里云, 3=腾讯云"
 
     def test_parse_eq_values(self):
         """解析等号枚举格式。"""
-        result = QueryAgent._parse_eq_values("5 = 火山, 1 = 正常, 2 = 禁用")
+        result = KnowledgeStore.parse_eq_values("5 = 火山, 1 = 正常, 2 = 禁用")
         assert result == "5=火山, 1=正常, 2=禁用"
 
     def test_infer_table_from_sql(self):
         """从 SQL 推断表名。"""
-        assert QueryAgent._infer_table_from_sql("SELECT * FROM tb_voice WHERE id=1") == "tb_voice"
-        assert QueryAgent._infer_table_from_sql("") == ""
-        assert QueryAgent._infer_table_from_sql("SELECT 1") == ""
+        assert KnowledgeStore.infer_table_from_sql("SELECT * FROM tb_voice WHERE id=1") == "tb_voice"
+        assert KnowledgeStore.infer_table_from_sql("") == ""
+        assert KnowledgeStore.infer_table_from_sql("SELECT 1") == ""
 
     def test_structured_field_knowledge_tag(self, tmp_path):
         """结构化 HTML 注释声明：优先解析。"""
@@ -1073,15 +1145,16 @@ agent:
             '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山,1=自研,2=阿里云"},'
             '{"table":"tb_voice","field":"forbidden_status","values":"1=正常,2=禁用"}] -->'
         )
-        agent._auto_extract_field_knowledge(response)
-        entries = agent.field_knowledge.get_entries()
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
         assert any(e.table == "tb_voice" and e.column == "origin" and "5=火山" in e.description for e in entries)
         assert any(e.table == "tb_voice" and e.column == "forbidden_status" and "1=正常" in e.description for e in entries)
+        assert all(e.business == "default" for e in entries)
 
     def test_structured_tag_strips_from_display(self, tmp_path):
         """结构化注释从展示文本中剥离。"""
         import re
-        tag_pattern = QueryAgent._FIELD_KNOWLEDGE_TAG
+        tag_pattern = KnowledgeStore.FIELD_KNOWLEDGE_TAG
         response = (
             "查询结果：42\n"
             '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山"}] -->'
@@ -1093,50 +1166,99 @@ agent:
     def test_fallback_field_eq_pattern(self, tmp_path):
         """回退模式: **来源(origin)**: 5 = 火山。"""
         agent = self._make_agent(tmp_path)
-        agent._last_query_context = {"sql": "SELECT origin FROM tb_voice WHERE deleted_at IS NULL"}
+        agent._conversation.last_query_context = {"sql": "SELECT origin FROM tb_voice WHERE deleted_at IS NULL"}
         response = "- **来源(origin)**: 5 = 火山\n- **可见性(visibility)**: 1 = 公用"
-        agent._auto_extract_field_knowledge(response)
-        entries = agent.field_knowledge.get_entries()
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
         assert any(e.column == "origin" and "5=火山" in e.description for e in entries)
         assert any(e.column == "visibility" and "1=公用" in e.description for e in entries)
 
     def test_fallback_field_enum_pattern(self, tmp_path):
         """回退模式: origin: 1(自研), 2(阿里云) — 需 SQL 推断表名。"""
         agent = self._make_agent(tmp_path)
-        agent._last_query_context = {"sql": "SELECT * FROM tb_voice"}
+        agent._conversation.last_query_context = {"sql": "SELECT * FROM tb_voice"}
         response = "origin: 1(自研), 2(阿里云), 3(腾讯云)"
-        agent._auto_extract_field_knowledge(response)
-        entries = agent.field_knowledge.get_entries()
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
         assert any(e.table == "tb_voice" and e.column == "origin" for e in entries)
 
     def test_fallback_table_field_enum_pattern(self, tmp_path):
         """回退模式: tb_voice.origin: 1(自研), 2(阿里云) — 直接提取。"""
         agent = self._make_agent(tmp_path)
         response = "tb_voice.origin: 1(自研), 2(阿里云)"
-        agent._auto_extract_field_knowledge(response)
-        entries = agent.field_knowledge.get_entries()
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
         assert any(e.table == "tb_voice" and e.column == "origin" and "1=自研" in e.description for e in entries)
 
     def test_no_extract_without_sql_for_fallback(self, tmp_path):
         """回退模式无 SQL 上下文时不提取。"""
         agent = self._make_agent(tmp_path)
-        agent._last_query_context = {}
+        agent._conversation.last_query_context = {}
         response = "origin: 1(自研), 2(阿里云)"
-        agent._auto_extract_field_knowledge(response)
-        entries = agent.field_knowledge.get_entries()
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
         assert not any(e.column == "origin" for e in entries)
 
     def test_mark_prompt_dirty_on_extract(self, tmp_path):
         """提取字段知识后标记 prompt 需重建。"""
         agent = self._make_agent(tmp_path)
-        agent._cached_system_prompt = "old prompt"
-        agent._prompt_dirty = False
+        agent._prompt_service._cached_prompt = "old prompt"
+        agent._prompt_service._dirty = False
         response = '<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"5=火山"}] -->'
-        agent._auto_extract_field_knowledge(response)
-        assert agent._prompt_dirty is True
+        self._extract(agent, response)
+        assert agent._prompt_service._dirty is True
         response = "tb_voice.origin: 5 = 火山"
-        agent._auto_extract_field_knowledge(response)
-        assert agent._prompt_dirty is True
+        self._extract(agent, response)
+        assert agent._prompt_service._dirty is True
+
+    def test_field_knowledge_isolated_by_business(self, tmp_path):
+        agent = self._make_agent(tmp_path)
+        agent.add_field_knowledge("digitalhuman", "tb_voice", "origin", "1=自研")
+        agent.add_field_knowledge("order", "tb_voice", "origin", "1=订单")
+
+        dh_entries = agent.list_field_knowledge("digitalhuman")
+        order_entries = agent.list_field_knowledge("order")
+
+        assert len(dh_entries) == 1
+        assert dh_entries[0].description == "1=自研"
+        assert len(order_entries) == 1
+        assert order_entries[0].description == "1=订单"
+
+    @pytest.mark.asyncio
+    async def test_remove_business_clears_business_field_knowledge(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+  order:
+    display_name: "订单"
+    mcp_server_url: "http://other:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        from src.field_knowledge import FieldKnowledgeManager
+        field_knowledge = FieldKnowledgeManager(
+            knowledge_path=str(tmp_path / "field_knowledge.json")
+        )
+        agent._knowledge_store.set_field_knowledge(field_knowledge)
+        agent._tool_execution.set_field_knowledge_manager(field_knowledge)
+        agent.add_field_knowledge("digitalhuman", "tb_voice", "origin", "1=自研")
+        agent.add_field_knowledge("order", "tb_voice", "origin", "1=订单")
+
+        await agent.remove_business("digitalhuman")
+
+        assert not agent.list_field_knowledge("digitalhuman")
+        assert len(agent.list_field_knowledge("order")) == 1
 
 
 class TestRiskNoteParse:
@@ -1144,41 +1266,144 @@ class TestRiskNoteParse:
 
     def test_index_driven_no_risk(self):
         """索引驱动 → 无风险。"""
-        level, reasons = QueryAgent._parse_risk_note("索引驱动: app_id")
+        level, reasons = ToolExecutionService.parse_risk_note("索引驱动: app_id")
         assert level == ""
         assert reasons == []
 
     def test_full_scan(self):
         """全表扫描 → high。"""
-        level, reasons = QueryAgent._parse_risk_note("全表扫描风险")
+        level, reasons = ToolExecutionService.parse_risk_note("全表扫描风险")
         assert level == "high"
         assert any("全表扫描" in r for r in reasons)
 
     def test_select_star(self):
         """SELECT * → medium。"""
-        level, reasons = QueryAgent._parse_risk_note("SELECT * 返回全列")
+        level, reasons = ToolExecutionService.parse_risk_note("SELECT * 返回全列")
         assert level == "medium"
         assert any("SELECT *" in r for r in reasons)
 
     def test_like_wildcard(self):
         """LIKE 前导通配符 → medium。"""
-        level, reasons = QueryAgent._parse_risk_note("LIKE 前导通配符")
+        level, reasons = ToolExecutionService.parse_risk_note("LIKE 前导通配符")
         assert level == "medium"
         assert any("LIKE" in r for r in reasons)
 
     def test_full_scan_plus_index_driven(self):
         """全表扫描 + 索引驱动同时出现 → high 优先（全表扫描是真实风险）。"""
-        level, reasons = QueryAgent._parse_risk_note("全表扫描风险，索引驱动: id")
+        level, reasons = ToolExecutionService.parse_risk_note("全表扫描风险，索引驱动: id")
         assert level == "high"
 
     def test_index_driven_ignores_select_star(self):
         """索引驱动时 SELECT * 不报风险（查询已高效，返回列多只是信息提示）。"""
-        level, reasons = QueryAgent._parse_risk_note("索引驱动: id, SELECT * 返回全列")
+        level, reasons = ToolExecutionService.parse_risk_note("索引驱动: id, SELECT * 返回全列")
         assert level == ""
         assert reasons == []
 
     def test_unknown_note_defaults_medium(self):
         """未知 risk_note → medium。"""
-        level, reasons = QueryAgent._parse_risk_note("其他风险提示")
+        level, reasons = ToolExecutionService.parse_risk_note("其他风险提示")
         assert level == "medium"
         assert reasons == ["其他风险提示"]
+
+
+class TestBusinessSelection:
+    def _make_multi_business_agent(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+  order:
+    display_name: "订单"
+    mcp_server_url: "http://other:8765/sse"
+"""
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            return QueryAgent(config_path=str(config_file))
+
+    @pytest.mark.asyncio
+    async def test_select_business_by_name(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        selection = await agent._business_selector.select_business("帮我查 digitalhuman 的数据")
+        assert selection.business is not None
+        assert selection.business.name == "digitalhuman"
+        assert selection.strategy == "heuristic"
+
+    @pytest.mark.asyncio
+    async def test_select_business_by_display_name(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        selection = await agent._business_selector.select_business("帮我查订单业务的数据")
+        assert selection.business is not None
+        assert selection.business.name == "order"
+        assert selection.strategy == "heuristic"
+
+    @pytest.mark.asyncio
+    async def test_select_business_returns_none_when_ambiguous(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        mock_response = MagicMock()
+        mock_response.text = "NONE"
+        agent.provider.chat = MagicMock(return_value=mock_response)
+        agent._business_selector = BusinessSelectionService(
+            provider=agent.provider,
+            model=agent.config.agent.model,
+            registry=agent.registry,
+        )
+        selection = await agent._business_selector.select_business("帮我查一下数据")
+        assert selection.business is None
+        assert selection.strategy == "fallback_all"
+
+    @pytest.mark.asyncio
+    async def test_select_business_falls_back_to_llm(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        mock_response = MagicMock()
+        mock_response.text = "order"
+        agent.provider.chat = MagicMock(return_value=mock_response)
+        agent._business_selector = BusinessSelectionService(
+            provider=agent.provider,
+            model=agent.config.agent.model,
+            registry=agent.registry,
+        )
+        selection = await agent._business_selector.select_business("帮我看一下退款进度")
+
+        assert selection.business is not None
+        assert selection.business.name == "order"
+        assert selection.strategy == "llm"
+
+    @pytest.mark.asyncio
+    async def test_run_query_multi_business_prefers_selected_business(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        agent._ensure_knowledge_loaded = AsyncMock()
+        agent._build_business_tools = AsyncMock(return_value=[{"name": "execute_readonly_sql"}])
+        agent._build_merged_tools = AsyncMock(return_value=[{"name": "execute_readonly_sql"}])
+        agent._multi_business_conversation_loop = AsyncMock(return_value="ok")
+        metrics = QueryMetrics()
+
+        result = await agent._run_query_multi_business("查询数字人的数据", metrics)
+
+        assert result == "ok"
+        agent._build_business_tools.assert_awaited_once_with("digitalhuman")
+        agent._build_merged_tools.assert_not_called()
+        assert metrics.selected_business == "digitalhuman"
+        assert metrics.business_selection_strategy == "heuristic"
+
+    @pytest.mark.asyncio
+    async def test_run_query_multi_business_falls_back_when_not_selected(self, tmp_path):
+        agent = self._make_multi_business_agent(tmp_path)
+        agent._ensure_knowledge_loaded = AsyncMock()
+        agent._build_business_tools = AsyncMock(return_value=[{"name": "execute_readonly_sql"}])
+        agent._build_merged_tools = AsyncMock(return_value=[{"name": "execute_readonly_sql"}])
+        agent._multi_business_conversation_loop = AsyncMock(return_value="ok")
+        metrics = QueryMetrics()
+
+        result = await agent._run_query_multi_business("查询所有数据", metrics)
+
+        assert result == "ok"
+        agent._build_merged_tools.assert_awaited_once()
+        assert metrics.selected_business == "all"
+        assert metrics.business_selection_strategy == "fallback_all"

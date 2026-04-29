@@ -13,7 +13,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MEMORY_PATH = "./error_memory.json"
 MAX_MEMORY_ENTRIES = 50  # 最多保留的错误记录数
 MAX_MEMORY_TOKENS = 500  # 错误记忆的 token 预算
 CHARS_PER_TOKEN = 1.5    # 中文粗略估算：1 字 ≈ 1.5 token
@@ -43,7 +42,7 @@ class ErrorMemory:
 class ErrorMemoryManager:
     """管理错误记忆的持久化读写和 prompt 生成。"""
 
-    def __init__(self, memory_path: str = DEFAULT_MEMORY_PATH):
+    def __init__(self, memory_path: str):
         self._path = memory_path
         self._memory = self._load()
 

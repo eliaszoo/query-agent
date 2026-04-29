@@ -51,6 +51,17 @@ class TestRemove:
         with pytest.raises(KeyError, match="不存在"):
             await registry.remove("nonexistent")
 
+    @pytest.mark.asyncio
+    async def test_remove_closes_cached_session(self):
+        registry = BusinessRegistry()
+        registry.register("digitalhuman", "http://host:8765/sse", "数字人")
+        registry._session_cache["digitalhuman"] = (MagicMock(), MagicMock())
+
+        with patch.object(registry, "_close_cached_session", new_callable=AsyncMock) as mock_close:
+            await registry.remove("digitalhuman")
+
+        mock_close.assert_awaited_once_with("digitalhuman")
+
 
 class TestHasBusiness:
     def test_has_business_true(self):
@@ -132,6 +143,18 @@ class TestCloseAll:
         registry.register("b", "http://b/sse")
         await registry.close_all()
         assert not registry.list_businesses()
+
+    @pytest.mark.asyncio
+    async def test_close_sessions_keeps_entries(self):
+        registry = BusinessRegistry()
+        registry.register("a", "http://a/sse")
+        registry._session_cache["a"] = (MagicMock(), MagicMock())
+
+        with patch.object(registry, "_close_cached_session", new_callable=AsyncMock) as mock_close:
+            await registry.close_sessions()
+
+        mock_close.assert_awaited_once_with("a")
+        assert registry.has_business("a")
 
 
 class TestSerializeToolResult:

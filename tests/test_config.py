@@ -14,6 +14,8 @@ from src.config import (
     BusinessKnowledge,
     BusinessEntryConfig,
     AuthConfig,
+    StorageConfig,
+    derive_storage_namespace,
     load_config,
     _substitute_env_vars,
 )
@@ -154,9 +156,11 @@ agent:
             assert isinstance(cfg.sql_security, SQLSecurityConfig)
             assert isinstance(cfg.agent, AgentConfig)
             assert isinstance(cfg.business_knowledge, BusinessKnowledge)
+            assert isinstance(cfg.storage, StorageConfig)
             assert cfg.sql_security.max_rows == 100
             assert cfg.agent.default_cluster == "test"
             assert cfg.business_knowledge.description == ""
+            assert cfg.storage.namespace == ""
         finally:
             os.unlink(path)
 
@@ -430,6 +434,55 @@ auth:
             assert cfg.auth.api_key == "my-secret-key"
         finally:
             os.unlink(path)
+
+
+class TestStorageConfig:
+    def test_storage_namespace_from_config(self):
+        yaml_content = """\
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "user"
+    password: "pass"
+storage:
+  namespace: "prod-digitalhuman"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            cfg = load_config(path)
+            assert cfg.storage.namespace == "prod-digitalhuman"
+        finally:
+            os.unlink(path)
+
+    def test_storage_invalid_type(self):
+        yaml_content = """\
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "user"
+    password: "pass"
+storage: "invalid"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            with pytest.raises(ConfigError, match="'storage' 配置格式无效"):
+                load_config(path)
+        finally:
+            os.unlink(path)
+
+    def test_derive_storage_namespace_is_stable(self):
+        namespace1 = derive_storage_namespace("/tmp/a/config.yaml")
+        namespace2 = derive_storage_namespace("/tmp/a/config.yaml")
+        namespace3 = derive_storage_namespace("/tmp/b/config.yaml")
+
+        assert namespace1 == namespace2
+        assert namespace1 != namespace3
 
     def test_auth_empty_by_default(self):
         path = _write_yaml(MINIMAL_VALID_YAML)

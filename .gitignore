@@ -23,3 +23,4 @@ error_memory.json
 env
 
 field_knowledge.json
+config-server-*.yaml

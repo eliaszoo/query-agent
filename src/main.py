@@ -79,7 +79,10 @@ def _setup_readline():
         pass
 
 # 反馈检测关键词
-_FEEDBACK_KEYWORDS = {"不对", "错了", "不是", "应该", "缺少", "遗漏", "多了", "少了", "不要", "不能"}
+_FEEDBACK_KEYWORDS = {
+    "不对", "错了", "不是", "应该", "缺少", "遗漏", "多了", "少了", "不要", "不能",
+    "记住", "默认", "以后都", "后续查询", "优先过滤",
+}
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -238,7 +241,7 @@ async def _handle_add(agent: QueryAgent, args: list[str]) -> None:
     display_name = args[2] if len(args) > 2 else name
     api_key = args[3] if len(args) > 3 else ""
 
-    agent.registry.register(name, url, display_name, api_key=api_key)
+    agent.add_business(name, url, display_name, api_key=api_key)
     print(f"  {_GREEN}Added{_RESET} business: {name} ({display_name}) -> {url}")
 
 
@@ -250,7 +253,7 @@ async def _handle_remove(agent: QueryAgent, args: list[str]) -> None:
 
     name = args[0]
     try:
-        await agent.registry.remove(name)
+        await agent.remove_business(name)
         print(f"  {_GREEN}Removed{_RESET} business: {name}")
     except KeyError as e:
         print(f"  {_RED}Error:{_RESET} {e}")
@@ -258,7 +261,7 @@ async def _handle_remove(agent: QueryAgent, args: list[str]) -> None:
 
 def _handle_list(agent: QueryAgent) -> None:
     """处理 /list 命令。"""
-    businesses = agent.registry.list_businesses()
+    businesses = agent.list_businesses()
     if not businesses:
         print(f"  {_DIM}No businesses registered. Use /add to add one.{_RESET}")
         return
@@ -270,13 +273,13 @@ def _handle_list(agent: QueryAgent) -> None:
 
 def _handle_memory(agent: QueryAgent) -> None:
     """处理 /memory 命令。"""
-    entries = agent.error_memory.get_entries()
+    entries = agent.get_error_memory_entries()
     if not entries:
         print(f"  {_DIM}No error memory.{_RESET}")
         return
 
     # 按业务分组显示
-    businesses = agent.error_memory.get_businesses()
+    businesses = agent.get_error_memory_businesses()
     for biz in businesses:
         biz_entries = [e for e in entries if e.business == biz]
         print(f"\n  {_BOLD}{biz}{_RESET} ({len(biz_entries)}):")
@@ -295,10 +298,10 @@ def _handle_clear(agent: QueryAgent, args: list[str]) -> None:
     """处理 /clear 命令。"""
     if args:
         biz_name = args[0]
-        agent.error_memory.clear(business=biz_name)
+        agent.clear_error_memory(business=biz_name)
         print(f"  {_GREEN}Cleared{_RESET} memory for business '{biz_name}'")
     else:
-        agent.error_memory.clear()
+        agent.clear_error_memory()
         print(f"  {_GREEN}Cleared{_RESET} all error memory")
 
 
@@ -380,8 +383,8 @@ async def main(config_path: str = "./config.yaml") -> None:
                 continue
             table, column = field_key.split(".", 1)
             description = " ".join(parts[2:])
-            agent.field_knowledge.add_field(table, column, description)
-            agent._mark_prompt_dirty()
+            business = agent.get_last_business()
+            agent.add_field_knowledge(business, table, column, description)
             print(f"  {_GREEN}Added field knowledge:{_RESET} {table}.{column}: {description}")
             continue
 
@@ -394,16 +397,16 @@ async def main(config_path: str = "./config.yaml") -> None:
                 print(f"  {_RED}Error:{_RESET} Field key must be in table.column format")
                 continue
             table, column = field_key.split(".", 1)
-            removed = agent.field_knowledge.remove_field(table, column)
+            business = agent.get_last_business()
+            removed = agent.remove_field_knowledge(business, table, column)
             if removed:
-                agent._mark_prompt_dirty()
                 print(f"  {_GREEN}Removed:{_RESET} {table}.{column}")
             else:
                 print(f"  {_YELLOW}Not found:{_RESET} {table}.{column}")
             continue
 
         if cmd == "/fields":
-            entries = agent.field_knowledge.get_entries()
+            entries = agent.list_field_knowledge()
             if not entries:
                 print(f"  {_DIM}No field knowledge recorded.{_RESET}")
             else:
@@ -434,25 +437,20 @@ async def main(config_path: str = "./config.yaml") -> None:
         # 检测用户反馈：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
         # 反馈只记录经验，不触发查询
         if last_query and last_response and _likely_feedback(user_input):
-            spinner = Spinner("Analyzing feedback")
-            _active_spinner = spinner
-            with spinner:
-                feedback_lesson = await agent.extract_feedback_lesson(
-                    original_query=last_query,
-                    agent_response=last_response,
-                    user_feedback=user_input,
-                )
-            _active_spinner = None
+            feedback_lesson = agent.extract_explicit_feedback_lesson(user_input)
+            if feedback_lesson is None:
+                spinner = Spinner("Analyzing feedback")
+                _active_spinner = spinner
+                with spinner:
+                    feedback_lesson = await agent.extract_feedback_lesson(
+                        original_query=last_query,
+                        agent_response=last_response,
+                        user_feedback=user_input,
+                    )
+                _active_spinner = None
             if feedback_lesson:
-                business = agent._last_query_context.get("business", "") if agent._last_query_context else ""
-                agent.error_memory.add_error(
-                    user_query=last_query,
-                    error_type="USER_FEEDBACK",
-                    business=business,
-                    error_message=user_input,
-                    lesson=feedback_lesson,
-                )
-                agent._mark_prompt_dirty()
+                business = agent.get_last_business()
+                agent.record_feedback(last_query, business, user_input, feedback_lesson)
                 print(f"  {_YELLOW}Saved lesson:{_RESET} {feedback_lesson}")
             else:
                 print(f"  {_DIM}No actionable lesson extracted from feedback.{_RESET}")
@@ -470,10 +468,17 @@ async def main(config_path: str = "./config.yaml") -> None:
             # 展示查询元信息
             if agent.last_metrics:
                 m = agent.last_metrics
+                selection_info = ""
+                if m.business_selection_strategy:
+                    selection_info = (
+                        f" | business={m.selected_business or 'unknown'}"
+                        f" via {m.business_selection_strategy}"
+                    )
                 print(
                     f"{_DIM}({m.duration_seconds}s | "
                     f"{m.input_tokens}+ {m.output_tokens}- | "
-                    f"{m.tool_calls} tool calls){_RESET}"
+                    f"{m.tool_calls} tool calls"
+                    f"{selection_info}){_RESET}"
                 )
 
             last_query = user_input
@@ -486,7 +491,7 @@ async def main(config_path: str = "./config.yaml") -> None:
 
     # 清理 SSE 连接，避免 asyncio 退出时报 cancel scope 错误
     try:
-        await agent.registry.close_all()
+        await agent.registry.close_sessions()
     except Exception:
         pass
 

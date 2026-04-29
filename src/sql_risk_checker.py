@@ -40,22 +40,24 @@ class SQLRiskChecker:
     """
 
     def __init__(self) -> None:
-        self._index_cache: dict[str, list[IndexInfo]] = {}
+        self._index_cache: dict[tuple[str, str, str], list[IndexInfo]] = {}
 
-    def update_indexes(self, table: str, indexes: list[IndexInfo]) -> None:
+    def update_indexes(
+        self, business: str, cluster: str, table: str, indexes: list[IndexInfo]
+    ) -> None:
         """更新表的索引信息缓存。
 
         Args:
             table: 表名。
             indexes: 该表的索引列表。
         """
-        self._index_cache[table] = indexes
+        self._index_cache[(business, cluster, table)] = indexes
 
-    def has_indexes(self, table: str) -> bool:
+    def has_indexes(self, business: str, cluster: str, table: str) -> bool:
         """检查某张表是否有索引信息。"""
-        return table in self._index_cache
+        return (business, cluster, table) in self._index_cache
 
-    def check(self, sql: str) -> RiskCheckResult:
+    def check(self, business: str, cluster: str, sql: str) -> RiskCheckResult:
         """分析 SQL 的性能风险。
 
         Args:
@@ -85,7 +87,7 @@ class SQLRiskChecker:
 
         # 1. 逐表检查索引覆盖
         for table in tables:
-            indexes = self._index_cache.get(table)
+            indexes = self._index_cache.get((business, cluster, table))
             if indexes is None:
                 # 没有索引信息，跳过索引分析
                 continue

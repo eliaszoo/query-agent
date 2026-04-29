@@ -308,3 +308,33 @@ class TestGetBusinesses:
 
     def test_empty_when_no_entries(self):
         assert self.manager.get_businesses() == []
+
+
+class TestNamespaceIsolation:
+    def test_different_paths_are_isolated(self):
+        tmpdir = tempfile.mkdtemp()
+        path_a = os.path.join(tmpdir, "a", "error_memory.json")
+        path_b = os.path.join(tmpdir, "b", "error_memory.json")
+        os.makedirs(os.path.dirname(path_a), exist_ok=True)
+        os.makedirs(os.path.dirname(path_b), exist_ok=True)
+
+        manager_a = ErrorMemoryManager(memory_path=path_a)
+        manager_b = ErrorMemoryManager(memory_path=path_b)
+
+        manager_a.add_error(
+            user_query="q1",
+            error_type="SQL_REJECTED",
+            business="digitalhuman",
+            lesson="经验A",
+        )
+        manager_b.add_error(
+            user_query="q2",
+            error_type="SQL_REJECTED",
+            business="order",
+            lesson="经验B",
+        )
+
+        assert len(manager_a.get_entries()) == 1
+        assert manager_a.get_entries()[0].lesson == "经验A"
+        assert len(manager_b.get_entries()) == 1
+        assert manager_b.get_entries()[0].lesson == "经验B"

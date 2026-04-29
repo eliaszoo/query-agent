@@ -33,6 +33,12 @@ class TestLikelyFeedback:
     def test_medium_with_keyword_is_feedback(self):
         assert _likely_feedback("不对，应该只查测试环境的") is True
 
+    def test_memory_style_feedback_is_feedback(self):
+        assert _likely_feedback("记住，后续查询默认只查可用的数据") is True
+
+    def test_default_rule_feedback_is_feedback(self):
+        assert _likely_feedback("以后都优先过滤禁用数据") is True
+
 
 class TestExitCommands:
     """Test that exit commands are correctly defined."""
@@ -148,6 +154,26 @@ class TestMainLoop:
     @pytest.mark.asyncio
     @patch("src.main.load_config")
     @patch("src.main.QueryAgent")
+    async def test_explicit_feedback_bypasses_llm_and_saves_lesson(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.run_query = AsyncMock(return_value="查询结果：共3条记录")
+        mock_agent.extract_explicit_feedback_lesson.return_value = "默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。"
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["查询所有数据", "记住，后续查询默认只查可用的数据", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.extract_explicit_feedback_lesson.assert_called_once_with("记住，后续查询默认只查可用的数据")
+        mock_agent.extract_feedback_lesson.assert_not_called()
+        mock_agent.record_feedback.assert_called_once()
+        captured = capsys.readouterr()
+        assert "Saved lesson" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
     async def test_query_error_allows_continue(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
@@ -186,14 +212,13 @@ class TestMainLoop:
     async def test_add_command(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.registry = MagicMock()
         mock_agent_cls.return_value = mock_agent
 
         inputs = iter(["/add order http://host:8765/sse 订单", "exit"])
         with patch("builtins.input", side_effect=inputs):
             await main()
 
-        mock_agent.registry.register.assert_called_once_with("order", "http://host:8765/sse", "订单", api_key="")
+        mock_agent.add_business.assert_called_once_with("order", "http://host:8765/sse", "订单", api_key="")
         captured = capsys.readouterr()
         assert "Added" in captured.out
 
@@ -203,15 +228,14 @@ class TestMainLoop:
     async def test_remove_command(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.registry = MagicMock()
-        mock_agent.registry.remove = AsyncMock()
+        mock_agent.remove_business = AsyncMock()
         mock_agent_cls.return_value = mock_agent
 
         inputs = iter(["/remove order", "exit"])
         with patch("builtins.input", side_effect=inputs):
             await main()
 
-        mock_agent.registry.remove.assert_called_once_with("order")
+        mock_agent.remove_business.assert_called_once_with("order")
         captured = capsys.readouterr()
         assert "Removed" in captured.out
 
@@ -221,8 +245,7 @@ class TestMainLoop:
     async def test_list_command(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.registry = MagicMock()
-        mock_agent.registry.list_businesses.return_value = [
+        mock_agent.list_businesses.return_value = [
             BusinessEntry(name="digitalhuman", display_name="数字人", mcp_server_url="http://a/sse"),
         ]
         mock_agent_cls.return_value = mock_agent
@@ -240,14 +263,13 @@ class TestMainLoop:
     async def test_clear_command_all(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.error_memory = MagicMock()
         mock_agent_cls.return_value = mock_agent
 
         inputs = iter(["/clear", "exit"])
         with patch("builtins.input", side_effect=inputs):
             await main()
 
-        mock_agent.error_memory.clear.assert_called_once_with()
+        mock_agent.clear_error_memory.assert_called_once_with()
         captured = capsys.readouterr()
         assert "Cleared" in captured.out
 
@@ -257,14 +279,13 @@ class TestMainLoop:
     async def test_clear_command_specific_business(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.error_memory = MagicMock()
         mock_agent_cls.return_value = mock_agent
 
         inputs = iter(["/clear digitalhuman", "exit"])
         with patch("builtins.input", side_effect=inputs):
             await main()
 
-        mock_agent.error_memory.clear.assert_called_once_with(business="digitalhuman")
+        mock_agent.clear_error_memory.assert_called_once_with(business="digitalhuman")
         captured = capsys.readouterr()
         assert "Cleared" in captured.out
 

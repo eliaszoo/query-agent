@@ -75,6 +75,7 @@ class BusinessRegistry:
         """
         if name not in self._entries:
             raise KeyError(f"业务 '{name}' 不存在")
+        await self._close_cached_session(name)
         del self._entries[name]
         logger.info("已移除业务: %s", name)
 
@@ -243,10 +244,14 @@ class BusinessRegistry:
                 })
             return tools
 
-    async def close_all(self) -> None:
-        """关闭所有缓存的 session 并清空注册。"""
+    async def close_sessions(self) -> None:
+        """关闭所有缓存的 session，保留业务注册。"""
         for name in list(self._session_cache.keys()):
             await self._close_cached_session(name)
+
+    async def close_all(self) -> None:
+        """关闭所有缓存的 session 并清空注册。"""
+        await self.close_sessions()
         self._entries.clear()
 
     @staticmethod

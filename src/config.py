@@ -3,6 +3,7 @@
 解析 YAML 配置文件，支持环境变量替换和配置完整性验证。
 """
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -82,6 +83,13 @@ class AuthConfig:
 
 
 @dataclass
+class StorageConfig:
+    """本地持久化存储配置。"""
+
+    namespace: str = ""  # 持久化命名空间；为空则由 config path 自动推导
+
+
+@dataclass
 class AppConfig:
     """应用顶层配置。"""
 
@@ -91,6 +99,7 @@ class AppConfig:
     business_knowledge: BusinessKnowledge = field(default_factory=BusinessKnowledge)
     businesses: dict[str, BusinessEntryConfig] = field(default_factory=dict)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
 
 
 # 环境变量占位符正则：匹配 ${VAR_NAME}
@@ -189,6 +198,10 @@ def _validate_config(raw: dict) -> None:
     if auth is not None and not isinstance(auth, dict):
         raise ConfigError("'auth' 配置格式无效")
 
+    storage = raw.get("storage")
+    if storage is not None and not isinstance(storage, dict):
+        raise ConfigError("'storage' 配置格式无效")
+
 
 def _build_app_config(raw: dict) -> AppConfig:
     """从原始字典构建类型安全的 AppConfig。
@@ -272,6 +285,11 @@ def _build_app_config(raw: dict) -> AppConfig:
         api_key=auth_raw.get("api_key", ""),
     )
 
+    storage_raw = raw.get("storage", {})
+    storage = StorageConfig(
+        namespace=storage_raw.get("namespace", ""),
+    )
+
     return AppConfig(
         clusters=clusters,
         sql_security=sql_security,
@@ -279,7 +297,16 @@ def _build_app_config(raw: dict) -> AppConfig:
         business_knowledge=business_knowledge,
         businesses=businesses,
         auth=auth,
+        storage=storage,
     )
+
+
+def derive_storage_namespace(config_path: str) -> str:
+    """从配置文件路径推导稳定的存储命名空间。"""
+    normalized = os.path.abspath(config_path)
+    stem = os.path.splitext(os.path.basename(normalized))[0] or "config"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+    return f"{stem}-{digest}"
 
 
 def load_config(path: str) -> AppConfig:
