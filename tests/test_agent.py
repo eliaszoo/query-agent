@@ -1137,3 +1137,48 @@ agent:
         response = "tb_voice.origin: 5 = 火山"
         agent._auto_extract_field_knowledge(response)
         assert agent._prompt_dirty is True
+
+
+class TestRiskNoteParse:
+    """_parse_risk_note 风险声明解析测试。"""
+
+    def test_index_driven_no_risk(self):
+        """索引驱动 → 无风险。"""
+        level, reasons = QueryAgent._parse_risk_note("索引驱动: app_id")
+        assert level == ""
+        assert reasons == []
+
+    def test_full_scan(self):
+        """全表扫描 → high。"""
+        level, reasons = QueryAgent._parse_risk_note("全表扫描风险")
+        assert level == "high"
+        assert any("全表扫描" in r for r in reasons)
+
+    def test_select_star(self):
+        """SELECT * → medium。"""
+        level, reasons = QueryAgent._parse_risk_note("SELECT * 返回全列")
+        assert level == "medium"
+        assert any("SELECT *" in r for r in reasons)
+
+    def test_like_wildcard(self):
+        """LIKE 前导通配符 → medium。"""
+        level, reasons = QueryAgent._parse_risk_note("LIKE 前导通配符")
+        assert level == "medium"
+        assert any("LIKE" in r for r in reasons)
+
+    def test_full_scan_plus_index_driven(self):
+        """全表扫描 + 索引驱动同时出现 → high 优先（全表扫描是真实风险）。"""
+        level, reasons = QueryAgent._parse_risk_note("全表扫描风险，索引驱动: id")
+        assert level == "high"
+
+    def test_index_driven_ignores_select_star(self):
+        """索引驱动时 SELECT * 不报风险（查询已高效，返回列多只是信息提示）。"""
+        level, reasons = QueryAgent._parse_risk_note("索引驱动: id, SELECT * 返回全列")
+        assert level == ""
+        assert reasons == []
+
+    def test_unknown_note_defaults_medium(self):
+        """未知 risk_note → medium。"""
+        level, reasons = QueryAgent._parse_risk_note("其他风险提示")
+        assert level == "medium"
+        assert reasons == ["其他风险提示"]

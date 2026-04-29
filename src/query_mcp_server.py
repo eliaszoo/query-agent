@@ -149,8 +149,16 @@ async def execute_readonly_sql(
     cluster: str,
     sql: str,
     max_rows: int = 100,
+    risk_note: str = "",
 ) -> dict:
-    """在指定集群上执行只读 SQL 查询。"""
+    """在指定集群上执行只读 SQL 查询。
+
+    Args:
+        cluster: 集群名称。
+        sql: SQL 查询语句。
+        max_rows: 最大返回行数。
+        risk_note: LLM 声明的性能风险分析（不影响执行，仅用于 Agent 侧风险展示）。
+    """
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:

@@ -484,6 +484,12 @@ async def main(config_path: str = "./config.yaml") -> None:
             print(f"\n  {_RED}Error:{_RESET} {e}")
             traceback.print_exc()
 
+    # 清理 SSE 连接，避免 asyncio 退出时报 cancel scope 错误
+    try:
+        await agent.registry.close_all()
+    except Exception:
+        pass
+
 
 def main_entry() -> None:
     """同步入口，供 pyproject.toml entry point 使用。"""

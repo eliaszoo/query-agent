@@ -107,6 +107,14 @@ class SQLRiskChecker:
             non_prefix_hits: list[str] = []
             no_index_hits: list[str] = []
 
+            # 先判断 WHERE 整体是否有驱动列（命中某索引前缀）
+            has_driving_column = any(
+                col == idx.columns[0]
+                for col in table_where_cols
+                for idx in indexes
+                if idx.columns
+            )
+
             for col in table_where_cols:
                 col_hit_prefix = False
                 col_hit_non_prefix = False
@@ -127,22 +135,21 @@ class SQLRiskChecker:
                         break
 
                 if not col_hit_prefix and not col_hit_non_prefix:
-                    # 列不在任何索引中
-                    no_index_hits.append(f"{col} 不在任何索引中")
+                    if not has_driving_column:
+                        # 无驱动列，此列导致全表扫描
+                        no_index_hits.append(f"{col} 不在任何索引中")
 
+            # 有驱动列时，非索引列是附加过滤，不构成风险 — 不加入 reasons
             if no_index_hits:
-                # 有列完全不在任何索引中
                 for hint in no_index_hits:
                     reasons.append(f"表 {table}: {hint}，可能无法高效使用索引")
                 risk_level = "high" if not risk_level or risk_level == "high" else risk_level
             if non_prefix_hits and not no_index_hits:
-                # 所有列都在索引中，但没有命中前缀
                 for hint in non_prefix_hits:
                     reasons.append(f"表 {table}: {hint}")
                 if not risk_level or risk_level == "medium":
                     risk_level = "medium"
             elif non_prefix_hits and hit_index:
-                # 部分列命中索引前缀，部分是非前缀
                 for hint in non_prefix_hits:
                     reasons.append(f"表 {table}: {hint}")
                 if not risk_level:

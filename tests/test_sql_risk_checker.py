@@ -82,15 +82,14 @@ class TestSQLRiskChecker:
         assert result.risk_level == "high"
 
     def test_mixed_prefix_and_no_index(self):
-        """部分列命中索引前缀，部分不在任何索引中 → high risk。"""
+        """部分列命中索引前缀，部分不在任何索引中 → 无索引风险（有驱动列，非索引列为附加过滤）。"""
         self.checker.update_indexes("tb_scene", [
             IndexInfo(table="tb_scene", name="idx_model_id", columns=["model_id"], unique=False, index_type="BTREE"),
         ])
         result = self.checker.check(
             "SELECT id FROM tb_scene WHERE model_id = 1 AND name = 'test'"
         )
-        assert result.has_risk
-        assert result.risk_level == "high"
+        assert not result.has_risk
 
     def test_mixed_prefix_and_non_prefix(self):
         """部分列命中索引前缀，部分命中非前缀列 → medium risk。"""
@@ -178,5 +177,39 @@ class TestSQLRiskChecker:
         ])
         result = self.checker.check(
             "SELECT s.id FROM tb_scene s JOIN tb_model m ON s.model_id = m.id WHERE s.id = 1"
+        )
+        assert not result.has_risk
+
+    # --- 驱动列识别 ---
+
+    def test_driving_column_lowers_non_index_to_medium(self):
+        """有驱动列时，非索引列不构成风险（附加过滤，查询已高效）。"""
+        self.checker.update_indexes("tb_scene_app", [
+            IndexInfo(table="tb_scene_app", name="idx_app_id", columns=["app_id"], unique=False, index_type="BTREE"),
+        ])
+        result = self.checker.check(
+            "SELECT COUNT(*) FROM tb_scene_app WHERE app_id = 1451305201 AND deleted_at IS NULL"
+        )
+        assert not result.has_risk
+
+    def test_no_driving_column_stays_high(self):
+        """无驱动列时，非索引列保持 high risk。"""
+        self.checker.update_indexes("tb_scene_app", [
+            IndexInfo(table="tb_scene_app", name="idx_app_id", columns=["app_id"], unique=False, index_type="BTREE"),
+        ])
+        result = self.checker.check(
+            "SELECT COUNT(*) FROM tb_scene_app WHERE status = 1 AND deleted_at IS NULL"
+        )
+        assert result.has_risk
+        assert result.risk_level == "high"
+        assert any("不在任何索引中" in r for r in result.risk_reasons)
+
+    def test_all_where_columns_hit_prefix_no_risk(self):
+        """所有 WHERE 列都命中索引前缀 → 无索引风险。"""
+        self.checker.update_indexes("tb_scene_app", [
+            IndexInfo(table="tb_scene_app", name="idx_app_id", columns=["app_id"], unique=False, index_type="BTREE"),
+        ])
+        result = self.checker.check(
+            "SELECT COUNT(*) FROM tb_scene_app WHERE app_id = 1451305201"
         )
         assert not result.has_risk

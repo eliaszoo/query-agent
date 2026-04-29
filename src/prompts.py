@@ -72,9 +72,14 @@ def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None =
     parts.append("7. 回复末尾用 HTML 注释声明字段含义，格式：")
     parts.append("   <!-- FIELD_KNOWLEDGE: [{\"table\":\"tb_xxx\",\"field\":\"yyy\",\"values\":\"1=正常,2=禁用\"}] -->")
     parts.append("   仅声明枚举/状态类字段，普通字段无需声明。table 取自 SQL 的 FROM 表名。")
+    parts.append("8. 调用 execute_readonly_sql 时通过 risk_note 参数声明性能风险分析：")
+    parts.append("   - WHERE 有索引驱动列（如 app_id 有索引）：risk_note=\"索引驱动: app_id\"")
+    parts.append("   - WHERE 无索引驱动列（全表扫描风险）：risk_note=\"全表扫描风险\"")
+    parts.append("   - SELECT * 或 LIKE '%...'：risk_note=\"SELECT * 返回全列\" 或 \"LIKE 前导通配符\"")
+    parts.append("   - 性能无风险时不填此参数")
 
     if bk.custom_rules:
-        for i, rule in enumerate(bk.custom_rules, 7):
+        for i, rule in enumerate(bk.custom_rules, 9):
             parts.append(f"{i}. {rule}")
 
     return "\n".join(parts)
@@ -148,5 +153,10 @@ def _build_multi_business_prompt(
     parts.append("7. 回复末尾用 HTML 注释声明字段含义，格式：")
     parts.append("   <!-- FIELD_KNOWLEDGE: [{\"table\":\"tb_xxx\",\"field\":\"yyy\",\"values\":\"1=正常,2=禁用\"}] -->")
     parts.append("   仅声明枚举/状态类字段，普通字段无需声明。table 取自 SQL 的 FROM 表名。")
+    parts.append("8. 调用 execute_readonly_sql 时通过 risk_note 参数声明性能风险分析：")
+    parts.append("   - WHERE 有索引驱动列（如 app_id 有索引）：risk_note=\"索引驱动: app_id\"")
+    parts.append("   - WHERE 无索引驱动列（全表扫描风险）：risk_note=\"全表扫描风险\"")
+    parts.append("   - SELECT * 或 LIKE '%...'：risk_note=\"SELECT * 返回全列\" 或 \"LIKE 前导通配符\"")
+    parts.append("   - 性能无风险时不填此参数")
 
     return "\n".join(parts)

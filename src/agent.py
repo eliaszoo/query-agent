@@ -541,6 +541,9 @@ class QueryAgent:
     ) -> str | None:
         """执行前检查：打印 SQL，检测性能风险，等待确认。
 
+        优先使用 LLM 在 risk_note 参数中声明的风险分析，
+        无 risk_note 时回退到静态索引检查。
+
         Args:
             tool_name: 工具名称。
             arguments: 工具参数。
@@ -554,21 +557,26 @@ class QueryAgent:
 
         sql = arguments.get("sql", "") if isinstance(arguments, dict) else ""
         cluster = arguments.get("cluster", "") if isinstance(arguments, dict) else ""
+        risk_note = arguments.get("risk_note", "") if isinstance(arguments, dict) else ""
 
         # 1. 打印 SQL
         print(f"  SQL ({cluster}): {sql}")
 
-        # 2. 确保索引信息已加载
-        await self._ensure_indexes_loaded()
+        # 2. 风险分析：优先用 LLM 的 risk_note，否则回退静态检查
+        if risk_note:
+            risk_level, reasons = self._parse_risk_note(risk_note)
+        else:
+            await self._ensure_indexes_loaded()
+            risk_result = self._risk_checker.check(sql)
+            risk_level = risk_result.risk_level
+            reasons = risk_result.risk_reasons
 
-        # 3. 性能风险检测
-        risk_result = self._risk_checker.check(sql)
-        if risk_result.has_risk:
-            print(f"  Risk [{risk_result.risk_level}]:")
-            for reason in risk_result.risk_reasons:
+        if reasons:
+            print(f"  Risk [{risk_level}]:")
+            for reason in reasons:
                 print(f"    - {reason}")
 
-            # 4. 等待用户确认
+            # 3. 等待用户确认
             if not self._confirm_callback("是否继续执行？(y/N): "):
                 return _json.dumps({
                     "success": False,
@@ -577,6 +585,43 @@ class QueryAgent:
                 }, ensure_ascii=False)
 
         return None
+
+    @staticmethod
+    def _parse_risk_note(note: str) -> tuple[str, list[str]]:
+        """解析 LLM 在 risk_note 中声明的风险分析。
+
+        格式示例:
+        - "索引驱动: app_id" → 无风险，索引驱动查询高效
+        - "全表扫描风险" → high, ["WHERE 条件无法命中索引，可能全表扫描"]
+        - "SELECT * 返回全列" → medium, ["SELECT * 返回全列"]
+        - "LIKE 前导通配符" → medium, ["LIKE 前导通配符，无法使用索引"]
+        """
+        note_lower = note.lower()
+        reasons = []
+        risk_level = ""
+
+        # 索引驱动 → 查询高效，不构成风险
+        is_index_driven = "索引驱动" in note_lower or ("索引" in note_lower and "驱动" in note_lower)
+
+        if "全表扫描" in note_lower:
+            reasons.append("WHERE 条件无法命中索引，可能全表扫描")
+            risk_level = "high"
+
+        if not is_index_driven:
+            # 非索引驱动的其他风险
+            if "select *" in note_lower:
+                reasons.append("SELECT * 返回全列")
+                risk_level = risk_level or "medium"
+
+            if "like" in note_lower and "%" in note:
+                reasons.append("LIKE 前导通配符，无法使用索引")
+                risk_level = risk_level or "medium"
+
+        if not reasons and not is_index_driven:
+            reasons.append(note)
+            risk_level = "medium"
+
+        return risk_level, reasons
 
     @staticmethod
     def _default_confirm(prompt: str) -> bool:

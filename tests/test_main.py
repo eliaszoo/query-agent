@@ -56,7 +56,8 @@ class TestWelcomeMessage:
     def test_single_business_welcome(self):
         businesses = [BusinessEntry(name="default", display_name="数字人平台", mcp_server_url="http://a/sse")]
         msg = _build_welcome_message(businesses)
-        assert "数字人平台" in msg
+        assert "query-agent" in msg
+        assert "数字人平台" not in msg
 
     def test_multi_business_welcome(self):
         businesses = [

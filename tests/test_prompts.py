@@ -61,7 +61,7 @@ class TestBuildSystemPromptSingleBusiness:
             custom_rules=["不要使用子查询"],
         )
         prompt = build_system_prompt(knowledge_map={"default": bk})
-        assert "7. 不要使用子查询" in prompt
+        assert "9. 不要使用子查询" in prompt
 
     def test_full_business_knowledge(self):
         """完整业务知识时所有节都出现。"""
@@ -77,7 +77,7 @@ class TestBuildSystemPromptSingleBusiness:
         assert "## 业务术语映射" in prompt
         assert "## 核心表关系" in prompt
         assert "## 常用状态码" in prompt
-        assert "7. 优先使用索引列查询" in prompt
+        assert "9. 优先使用索引列查询" in prompt
 
     def test_query_rules_always_present(self):
         """查询规则始终存在。"""
