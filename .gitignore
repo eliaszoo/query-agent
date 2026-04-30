@@ -24,3 +24,5 @@ env
 
 field_knowledge.json
 config-server-*.yaml
+PRODUCT_BACKLOG.md
+.query-agent

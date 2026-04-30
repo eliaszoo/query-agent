@@ -16,6 +16,8 @@ from src.business_selection_service import BusinessSelectionService
 from src.conversation_state import ConversationState
 from src.error_memory import ErrorMemoryManager
 from src.knowledge_store import KnowledgeStore
+from src.llm_provider import LLMResponse
+from src.query_rule_executor import QueryRuleExecutor
 from src.tool_execution_service import ToolExecutionService
 
 
@@ -227,7 +229,60 @@ businesses:
         assert "digitalhuman" in names
         assert "order" in names
 
-    def test_init_uses_derived_storage_namespace(self, tmp_path):
+    def test_init_uses_business_name_as_namespace(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://localhost:8765/sse"
+agent:
+  model: "claude-sonnet-4-20250514"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        assert agent._storage_namespace == "digitalhuman"
+        assert "digitalhuman" in agent._knowledge_store.error_memory._path
+
+    def test_init_uses_description_as_namespace(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+business_knowledge:
+  description: "数字人平台"
+agent:
+  model: "claude-sonnet-4-20250514"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        assert agent._storage_namespace == "数字人平台"
+        assert "数字人平台" in agent._knowledge_store.error_memory._path
+
+    def test_init_falls_back_to_path_hash(self, tmp_path):
+        """无 businesses、无 description、无显式 namespace 时，兜底到路径哈希。"""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             """
@@ -247,9 +302,9 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        assert ".query-agent" in agent._knowledge_store.error_memory._path
+        # 兜底应为 config-<hash> 格式
+        assert agent._storage_namespace.startswith("config-")
         assert agent._storage_namespace in agent._knowledge_store.error_memory._path
-        assert agent._storage_namespace in agent._knowledge_store.field_knowledge._path
 
     def test_init_uses_explicit_storage_namespace(self, tmp_path):
         config_file = tmp_path / "config.yaml"
@@ -275,6 +330,178 @@ agent:
 
         assert agent._storage_namespace == "prod-order"
         assert "prod-order" in agent._knowledge_store.error_memory._path
+
+    def test_init_creates_preference_rules_storage(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "claude-sonnet-4-20250514"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.add_preference_rule("default", "默认只查可用数据", source="test")
+        rules = agent.list_preference_rules("default")
+        assert len(rules) == 1
+        assert rules[0].rule == "默认只查可用数据"
+        assert rules[0].rule_type == "available_only"
+
+    def test_lock_and_clear_business(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.lock_business("digitalhuman")
+        assert agent.get_locked_business() == "digitalhuman"
+
+        agent.clear_locked_business()
+        assert agent.get_locked_business() == ""
+
+
+class TestQueryPlan:
+    @pytest.mark.asyncio
+    async def test_build_query_plan_stdio_mode(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        plan = await agent.build_query_plan("查询所有数据")
+        assert plan.business == "default"
+        assert plan.business_strategy == "single"
+        assert plan.business_reason == "单业务 stdio 模式"
+
+    @pytest.mark.asyncio
+    async def test_build_query_plan_locked_business(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+  order:
+    display_name: "订单"
+    mcp_server_url: "http://other:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.lock_business("digitalhuman")
+        plan = await agent.build_query_plan("查询订单")
+        assert plan.business == "digitalhuman"
+        assert plan.business_strategy == "locked"
+        assert "已锁定业务" in plan.business_reason
+        assert plan.locked_business == "digitalhuman"
+
+    @pytest.mark.asyncio
+    async def test_build_query_plan_uses_auto_selection(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+  order:
+    display_name: "订单"
+    mcp_server_url: "http://other:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        plan = await agent.build_query_plan("查询数字人的数据")
+        assert plan.business == "digitalhuman"
+        assert plan.business_strategy == "heuristic"
+        assert "命中业务名或显示名" in plan.business_reason
+
+    @pytest.mark.asyncio
+    async def test_run_query_multi_business_uses_locked_business(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+agent:
+  model: "test-model"
+  max_tokens: 1024
+  default_cluster: "test"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    mcp_server_url: "http://host:8765/sse"
+  order:
+    display_name: "订单"
+    mcp_server_url: "http://other:8765/sse"
+"""
+        )
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            agent = QueryAgent(config_path=str(config_file))
+
+        agent.lock_business("order")
+        agent._ensure_knowledge_loaded = AsyncMock()
+        agent._build_business_tools = AsyncMock(return_value=[])
+        agent._multi_business_conversation_loop = AsyncMock(return_value="ok")
+        agent.provider.chat = MagicMock(return_value=LLMResponse(stop_reason="end_turn", text="ok"))
+
+        await agent.run_query("查询数字人的数据")
+
+        assert agent.last_metrics is not None
+        assert agent.last_metrics.selected_business == "order"
+        assert agent.last_metrics.business_selection_strategy == "locked"
+        assert "已锁定业务" in agent.last_metrics.business_selection_reason
+        agent._build_business_tools.assert_awaited_once_with("order")
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +1070,56 @@ class TestExtractFeedbackLesson:
         lesson = QueryAgent.extract_explicit_feedback_lesson("记住，后续查询默认只查可用的数据")
         assert lesson == "默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。"
 
+    def test_extract_explicit_feedback_rule_for_available_data(self):
+        rule = QueryAgent.extract_explicit_feedback_rule("记住，后续查询默认只查可用的数据")
+        assert rule is not None
+        assert rule["rule_type"] == "available_only"
+        assert rule["payload"]["forbidden_status"] == 1
+
+    def test_query_rule_executor_applies_available_only_sql(self):
+        rule = MagicMock(
+            rule="默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。",
+            rule_type="available_only",
+            payload={"deleted_at_is_null": True, "forbidden_status": 1},
+        )
+        result = QueryRuleExecutor.apply(
+            "查两个公共音色",
+            "default",
+            [rule],
+            arguments={"sql": "SELECT * FROM tb_voice LIMIT 2"},
+        )
+        assert "deleted_at IS NULL" in result.arguments["sql"]
+        assert "forbidden_status = 1" in result.arguments["sql"]
+
+    def test_query_rule_executor_overrides_available_only_when_user_requests_all(self):
+        rule = MagicMock(
+            rule="默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。",
+            rule_type="available_only",
+            payload={"deleted_at_is_null": True, "forbidden_status": 1},
+        )
+        result = QueryRuleExecutor.apply(
+            "查全部数据",
+            "default",
+            [rule],
+            arguments={"sql": "SELECT * FROM tb_voice LIMIT 2"},
+        )
+        assert "deleted_at IS NULL" not in result.arguments["sql"]
+        assert any(item.overridden for item in result.applications)
+
+    def test_query_rule_executor_fills_default_cluster(self):
+        rule = MagicMock(
+            rule="默认优先查询测试环境，除非用户明确指定生产环境。",
+            rule_type="default_cluster_test",
+            payload={"cluster": "test"},
+        )
+        result = QueryRuleExecutor.apply(
+            "查两个公共音色",
+            "default",
+            [rule],
+            arguments={"sql": "SELECT * FROM tb_voice LIMIT 2"},
+        )
+        assert result.arguments["cluster"] == "test"
+
     def test_extract_explicit_feedback_lesson_returns_none_for_plain_query(self):
         lesson = QueryAgent.extract_explicit_feedback_lesson("帮我查两个公共音色")
         assert lesson is None
@@ -1162,6 +1439,20 @@ agent:
         display = tag_pattern.sub('', response).rstrip()
         assert "FIELD_KNOWLEDGE" not in display
         assert "查询结果：42" in display
+
+    def test_extract_from_markdown_table(self, tmp_path):
+        agent = self._make_agent(tmp_path)
+        agent._conversation.last_query_context = {"sql": "SELECT origin, visibility FROM tb_voice"}
+        response = (
+            "| 字段 | 音色1 | 音色2 |\n"
+            "|---|---|---|\n"
+            "| **来源(origin)** | 5（火山） | 1（自研） |\n"
+            "| **可见性(visibility)** | 1（公用） | 2（私有） |"
+        )
+        self._extract(agent, response)
+        entries = agent.list_field_knowledge()
+        assert any(e.column == "origin" and "5=火山" in e.description and "1=自研" in e.description for e in entries)
+        assert any(e.column == "visibility" and "1=公用" in e.description and "2=私有" in e.description for e in entries)
 
     def test_fallback_field_eq_pattern(self, tmp_path):
         """回退模式: **来源(origin)**: 5 = 火山。"""

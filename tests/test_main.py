@@ -1,6 +1,7 @@
 """Tests for the CLI entry point (main.py)."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -78,8 +79,12 @@ class TestWelcomeMessage:
     def test_welcome_contains_slash_commands(self):
         msg = _build_welcome_message()
         assert "/add" in msg
+        assert "/business" in msg
         assert "/list" in msg
         assert "/memory" in msg
+        assert "/plan" in msg
+        assert "/remember" in msg
+        assert "/rules" in msg
         assert "/clear" in msg
         assert "/new" in msg
 
@@ -260,6 +265,95 @@ class TestMainLoop:
     @pytest.mark.asyncio
     @patch("src.main.load_config")
     @patch("src.main.QueryAgent")
+    async def test_remember_command_saves_rule(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.get_last_business.return_value = "digitalhuman"
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/remember 默认只查可用数据", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.add_preference_rule.assert_called_once_with(
+            "digitalhuman", "默认只查可用数据", source="manual"
+        )
+        captured = capsys.readouterr()
+        assert "Saved default rule" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_rules_command_prints_rules(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.list_preference_rules.return_value = [
+            MagicMock(business="digitalhuman", rule="默认只查可用数据")
+        ]
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/rules", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        captured = capsys.readouterr()
+        assert "默认只查可用数据" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_memory_command_hides_user_feedback_entries(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.get_error_memory_entries.return_value = [
+            SimpleNamespace(business="digitalhuman", error_type="USER_FEEDBACK", lesson="默认只查可用数据"),
+            SimpleNamespace(business="digitalhuman", error_type="FORBIDDEN_TABLE", lesson="只能查询白名单中的表"),
+        ]
+        mock_agent.get_error_memory_businesses.return_value = ["digitalhuman"]
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/memory", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        captured = capsys.readouterr()
+        assert "FORBIDDEN_TABLE" in captured.out
+        assert "USER_FEEDBACK" not in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_query_prints_applied_and_overridden_rules(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.run_query = AsyncMock(return_value="查询结果：共3条记录")
+        mock_agent.list_preference_rules.side_effect = [[MagicMock(rule="默认只查可用数据")], [MagicMock(rule="默认只查可用数据")]]
+        mock_agent.last_metrics = SimpleNamespace(
+            duration_seconds=1.2,
+            input_tokens=10,
+            output_tokens=5,
+            tool_calls=1,
+            business_selection_strategy="single",
+            business_selection_reason="单业务 stdio 模式",
+            selected_business="default",
+            applied_rules=["默认只查可用数据"],
+            overridden_rules=["默认只查可用数据（已覆盖: 用户本次明确要求查看全部/禁用/已删除数据）"],
+        )
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["查询所有数据", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        captured = capsys.readouterr()
+        assert "Applying default rules" in captured.out
+        assert "Applied rules" in captured.out
+        assert "Overridden rules" in captured.out
+        assert "Route" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
     async def test_clear_command_all(self, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
@@ -288,6 +382,85 @@ class TestMainLoop:
         mock_agent.clear_error_memory.assert_called_once_with(business="digitalhuman")
         captured = capsys.readouterr()
         assert "Cleared" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_business_current_command(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.get_locked_business.return_value = "digitalhuman"
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/business current", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        captured = capsys.readouterr()
+        assert "Locked business" in captured.out
+        assert "digitalhuman" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_business_set_command(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/business set digitalhuman", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.lock_business.assert_called_once_with("digitalhuman")
+        captured = capsys.readouterr()
+        assert "Locked business" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_business_clear_command(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/business clear", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.clear_locked_business.assert_called_once_with()
+        captured = capsys.readouterr()
+        assert "Cleared" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    async def test_plan_command(self, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent = MagicMock()
+        mock_agent.build_query_plan = AsyncMock(
+            return_value=SimpleNamespace(
+                business="digitalhuman",
+                business_display_name="数字人",
+                business_strategy="heuristic",
+                business_reason="用户输入命中业务名或显示名：数字人",
+                locked_business="",
+                default_cluster="test",
+                active_rules=["默认只查可用数据"],
+                overridden_rules=[],
+            )
+        )
+        mock_agent_cls.return_value = mock_agent
+
+        inputs = iter(["/plan 查询数字人的数据", "exit"])
+        with patch("builtins.input", side_effect=inputs):
+            await main()
+
+        mock_agent.build_query_plan.assert_awaited_once_with("查询数字人的数据")
+        captured = capsys.readouterr()
+        assert "Query Plan" in captured.out
+        assert "digitalhuman" in captured.out
+        assert "默认只查可用数据" in captured.out
 
 
 class TestMainEntry:

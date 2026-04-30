@@ -1,109 +1,117 @@
 # Query Agent
 
-通用 MySQL 查询 Agent，用户输入自然语言，LLM 自动生成 SQL 并执行只读查询。支持多业务路由、多 LLM Provider、索引级风险检测。
+通用业务数据查询 Agent — 用户输入自然语言，Agent 调用 LLM 生成 SQL，通过 MCP Server 执行只读查询并返回结果。
 
-## 核心能力
+## 特性
 
-- 自然语言 → SQL，支持多轮对话上下文
-- 多业务动态路由：单 Agent 连接多个 MCP Server，LLM 自动选择目标业务
-- 多 LLM Provider：Anthropic Claude / OpenAI GPT / DeepSeek / GLM / Qwen
-- SQL 安全管道：白名单表 → SELECT-only → 禁止锁子句 → 强制 LIMIT → 注释剥离
-- 索引级性能风险检测：基于 `SHOW INDEX` 信息判断查询是否命中索引
-- 业务领域知识注入：术语映射、表关系、状态码，通过 YAML 或 MCP 工具动态加载
-- 字段知识持久化：自动从 LLM 回复中提取枚举字段含义，后续查询直接使用无需重复探索
-- 错误记忆：自动从失败中学习，将教训注入后续 system prompt
+- **自然语言转 SQL** — 用户无需写 SQL，用中文描述即可查询
+- **多业务路由** — 单个 Agent 实例可同时对接多个业务系统，自动识别并路由
+- **双部署模式** — 本地 stdio 模式（开发调试）和远程 SSE 模式（生产部署）
+- **多 LLM 支持** — Anthropic Claude / OpenAI 兼容接口（DeepSeek、GLM、Qwen 等）
+- **智能学习** — 错误记忆、字段知识自动提取、用户偏好规则持久化
+- **SQL 安全保障** — 只读查询、白名单表、禁止锁子句、LIMIT 强制
+- **性能风险检测** — 基于索引信息分析 SQL 执行风险，高危查询需用户确认
+- **多轮对话** — 支持上下文引用（"再查一下"、"换成生产环境"等）
 
 ## 架构
 
+```text
+┌──────────────┐
+│   CLI / REPL │  src/main.py
+└──────┬───────┘
+       │
+┌──────▼───────┐
+│  QueryAgent  │  src/agent.py
+│              │
+│  ┌───────────────────────────────────┐
+│  │ ConversationState                 │
+│  │ BusinessSelectionService          │
+│  │ PromptService                     │
+│  │ ToolExecutionService              │
+│  │ KnowledgeStore                    │
+│  │ QueryRuleExecutor                 │
+│  └───────────────────────────────────┘
+└──────┬───────┘
+       │
+   ┌───┴────────────────────┐
+   │                        │
+┌──▼──────────┐  ┌─────────▼────────┐
+│ stdio 模式   │  │ SSE 模式          │
+│ 本地子进程    │  │ BusinessRegistry  │
+│             │  │ → MCP Server A    │
+│             │  │ → MCP Server B    │
+└──┬──────────┘  └─────────┬────────┘
+   │                        │
+┌──▼────────────────────────▼──┐
+│     MCP Server               │  src/query_mcp_server.py
+│                              │
+│  execute_readonly_sql        │
+│  get_cluster_list            │
+│  get_table_schema            │
+│  get_table_indexes           │
+│  get_business_knowledge      │
+│                              │
+│  SQLValidator → DB Pool      │
+└──────────────────────────────┘
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Agent (客户端)                        │
-│                                                          │
-│   ┌──────────┐    ┌──────────────┐    ┌────────────┐    │
-│   │ CLI REPL │───→│ LLM Provider │───→│ Tool Router │    │
-│   └──────────┘    └──────────────┘    └─────┬──────┘    │
-│                                              │           │
-│                                    ┌─────────┴──────┐   │
-│                                    │BusinessRegistry │   │
-│                                    └──┬─────────┬───┘   │
-│                                       │         │       │
-│                              ┌────────┴──┐ ┌────┴─────┐ │
-│                              │RiskChecker │ │ErrMemory  │ │
-│                              └───────────┘ │FieldKnow  │ │
-│                                            └───────────┘ │
-└──────────────────────────────┼───────────────────────────┘
-                                 │
-                          stdio / SSE
-                                 │
-┌────────────────────────────────┼────────────────────────┐
-│                        MCP Server (服务端)               │
-│                                │                        │
-│   ┌────────────────────────────┴──────────────────┐     │
-│   │  execute_readonly_sql  │  get_table_schema     │     │
-│   │  get_cluster_list      │  get_table_indexes    │     │
-│   │  get_business_knowledge                        │     │
-│   └────────────────────────┬──────────────────────┘     │
-│                            │                            │
-│               ┌────────────┴────────────┐               │
-│               │  SQL Validator          │               │
-│               │  Connection Pool        │               │
-│               └────────────┬────────────┘               │
-│                            │                            │
-│                     MySQL (只读)                         │
-└─────────────────────────────────────────────────────────┘
-```
 
-两种部署模式：
-
-| 模式 | Agent | MCP Server | 传输 | 场景 |
-|------|-------|------------|------|------|
-| stdio 一体 | 本地 | 本地子进程 | stdin/stdout | 开发调试、单业务 |
-| SSE 分离 | 本地 | 远程（靠近 DB） | HTTP/SSE | 生产部署、多业务 |
-
-## 快速开始
-
-### 安装
+## 安装
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 本地 stdio 模式
-
-Agent 和 MCP Server 在同一进程，适合开发调试：
+安装后可直接使用入口命令：
 
 ```bash
+query-agent --config config.yaml
+```
+
+## 快速开始
+
+### 本地 stdio 模式
+
+适合开发调试和单业务场景。Agent 自动拉起本地 MCP Server 子进程。
+
+```bash
+# 设置环境变量
 export ANTHROPIC_API_KEY=sk-xxx
 export DB_TEST_HOST=127.0.0.1
 export DB_TEST_PASSWORD=xxx
 
+# 启动
 python -m src.main --config config.yaml
 ```
 
 ### 远程 SSE 模式
 
-MCP Server 部署在数据库所在机器，Agent 通过 SSE 远程连接：
+适合生产部署和多业务场景。MCP Server 独立部署，Agent 通过 SSE 连接。
+
+**1. 启动 MCP Server**（在数据库所在机器上）：
 
 ```bash
-# 1. 启动 MCP Server（数据库机器）
+export MCP_API_KEY=your-secret
 export DB_TEST_HOST=127.0.0.1
 export DB_TEST_PASSWORD=xxx
-export MCP_API_KEY=your-secret
 
-python -m src.query_mcp_server --transport sse --config config-server.yaml
+MCP_HOST=0.0.0.0 MCP_PORT=8765 python -m src.query_mcp_server --transport sse --config config-server.yaml
+```
 
-# 2. 启动 Agent（本地）
+**2. 启动 Agent**：
+
+```bash
 export LLM_API_KEY=xxx
-export MCP_API_KEY=your-secret
 
 python -m src.main --config config-local.yaml
 ```
 
 ## 配置
 
-配置文件使用 YAML 格式，支持 `${ENV_VAR}` 环境变量替换。
+配置文件为 YAML，支持 `${ENV_VAR}` 环境变量替换。
 
-### 全量配置（config.yaml）— stdio 一体模式
+### 单业务本地模式
+
+完整配置示例（Agent + MCP Server 合一）：
 
 ```yaml
 clusters:
@@ -114,6 +122,13 @@ clusters:
     database: "mydb"
     user: "readonly_user"
     password: "${DB_TEST_PASSWORD}"
+  production:
+    description: "生产环境"
+    host: "${DB_PROD_HOST}"
+    port: 3306
+    database: "mydb"
+    user: "readonly_user"
+    password: "${DB_PROD_PASSWORD}"
 
 sql_security:
   max_rows: 100
@@ -121,25 +136,36 @@ sql_security:
   allowed_tables:
     - "tb_user"
     - "tb_order"
+    - "tb_product"
 
 business_knowledge:
-  description: "业务平台"
+  description: "电商系统"
   term_mappings:
     "用户": "tb_user 表"
+    "订单": "tb_order 表"
+    "商品": "tb_product 表"
   table_relationships:
-    - "tb_order.user_id → tb_user.id"
+    - "tb_order.user_id → tb_user.id（订单所属用户）"
+    - "tb_order.product_id → tb_product.id（订单关联商品）"
   status_codes:
-    - "tb_order.status: 1=待支付, 2=已支付"
-  custom_rules: []
+    - "tb_order.status: 1=待支付, 2=已支付, 3=已发货, 4=已完成"
+    - "tb_user.status: 1=活跃, 0=禁用"
+  custom_rules:
+    - "查询订单时默认按创建时间倒序排列"
 
 agent:
   provider: "anthropic"
   model: "claude-sonnet-4-20250514"
   max_tokens: 4096
   default_cluster: "test"
+
+storage:
+  namespace: "local-dev"
 ```
 
-### 多业务配置（config-local.yaml）— SSE 分离模式
+### 多业务远程模式
+
+Agent 端配置，每个业务指向独立的 MCP Server：
 
 ```yaml
 agent:
@@ -148,174 +174,276 @@ agent:
   max_tokens: 4096
   api_key: "${LLM_API_KEY}"
   base_url: "${LLM_BASE_URL}"
+  default_cluster: "test"
 
 businesses:
   digitalhuman:
     display_name: "数字人"
-    mcp_server_url: "http://mcp-host:8765/sse"
+    mcp_server_url: "http://mcp-host-a:8765/sse"
     api_key: "${MCP_API_KEY}"
   order:
     display_name: "订单"
-    mcp_server_url: "http://other-host:8765/sse"
+    mcp_server_url: "http://mcp-host-b:8765/sse"
+    api_key: "${MCP_API_KEY}"
+
+storage:
+  namespace: "prod-agent"
 ```
 
-### LLM Provider 选项
+### MCP Server 独立配置
 
-| Provider | provider 值 | 示例 model | 需要 base_url |
-|----------|-------------|-----------|--------------|
-| Anthropic Claude | `anthropic` | `claude-sonnet-4-20250514` | 否 |
-| OpenAI GPT | `openai_compatible` | `gpt-4o` | `https://api.openai.com/v1` |
-| DeepSeek | `openai_compatible` | `deepseek-chat` | `https://api.deepseek.com` |
-| GLM (智谱) | `openai_compatible` | `glm-5.1` | `https://open.bigmodel.cn/api/paas/v4` |
-| Qwen (通义千问) | `openai_compatible` | `qwen-plus` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+部署在数据库所在机器上的配置文件：
+
+```yaml
+clusters:
+  test:
+    description: "测试环境"
+    host: "${DB_TEST_HOST}"
+    port: 3306
+    database: "${DB_TEST_DB}"
+    user: "${DB_TEST_USER}"
+    password: "${DB_TEST_PASSWORD}"
+
+sql_security:
+  max_rows: 100
+  query_timeout: 30
+  allowed_tables:
+    - "tb_scene"
+    - "tb_model"
+
+business_knowledge:
+  description: "数字人平台"
+  term_mappings:
+    "模型": "tb_model 表"
+    "形象/数字人": "tb_scene 表"
+  table_relationships:
+    - "tb_scene.model_id → tb_model.id（形象属于某个模型）"
+  status_codes:
+    - "tb_scene.status: 1=训练中, 2=训练成功, 3=训练失败"
+  custom_rules: []
+
+auth:
+  api_key: "${MCP_API_KEY}"
+```
+
+### 兼容说明
+
+如果只配置 `agent.mcp_server_url` 而不配置 `businesses`，系统会自动创建名为 `default` 的业务，兼容旧配置。
+
+### Provider 配置
+
+| Provider | `agent.provider` 值 | 说明 |
+|---|---|---|
+| Anthropic Claude | `anthropic` | 直接使用 Anthropic SDK |
+| DeepSeek / GLM / Qwen / GPT | `openai_compatible` | 使用 OpenAI 兼容接口，需配 `base_url` |
+
+### 业务领域知识生成
+
+可使用 AI 辅助生成 `business_knowledge` 配置。将数据库 DDL（`SHOW CREATE TABLE` 输出）提供给 AI，结合以下提示词：
+
+```
+你是一个数据库业务领域知识提取专家。请根据提供的数据库表结构，生成 YAML 格式的业务领域知识配置。
+
+输出格式：
+business_knowledge:
+  description: "一句话业务描述"
+  term_mappings:        # 用户常用术语 → 表名映射
+    "术语": "表名 表"
+  table_relationships:  # 外键关系
+    - "表A.列 → 表B.列（关系说明）"
+  status_codes:         # 状态/枚举字段
+    - "表.列: 0=含义, 1=含义"
+  custom_rules: []      # 业务特有查询规则
+```
 
 ## REPL 命令
 
-输入 `/` 后按 Tab 可自动补全命令。
+输入 `/` 后按 Tab 可补全命令。
 
 | 命令 | 说明 |
-|------|------|
-| `/add <name> <url> [显示名] [api_key]` | 动态添加业务 |
+|---|---|
+| `/add <name> <url> [display] [api_key]` | 动态添加业务 |
 | `/remove <name>` | 移除业务 |
 | `/list` | 列出已注册业务 |
-| `/memory` | 查看错误记忆（按业务分组） |
-| `/clear [business]` | 清空错误记忆 |
-| `/new` | 新对话（清空上下文） |
-| `/pin <message>` | 置顶上下文（压缩历史后保留） |
+| `/new` | 开始新对话 |
+| `/pin <message>` | 置顶重要上下文（压缩时保留） |
 | `/field <table>.<col> <desc>` | 添加字段知识 |
 | `/field_rm <table>.<col>` | 删除字段知识 |
 | `/fields` | 列出所有字段知识 |
+| `/remember <rule>` | 保存默认查询规则 |
+| `/rules` | 查看默认规则 |
+| `/rules_clear [business]` | 清空默认规则 |
+| `/memory` | 查看错误记忆 |
+| `/clear [business]` | 清空错误记忆 |
 | `exit` / `quit` / `q` | 退出 |
 
-## MCP Server 安全机制
+## 查询执行流程
 
-MCP Server 以 SSE 模式暴露在网络上时，有多层安全防护：
+一次查询的完整链路：
 
-### 1. Bearer Token 鉴权
-
-SSE 模式下所有 HTTP/WebSocket 请求必须携带 `Authorization: Bearer <api_key>`，否则返回 401/403。
-
-API Key 配置（优先级从高到低）：
-
-| 来源 | 配置方式 |
-|------|---------|
-| 配置文件 | `auth.api_key: "your-secret"` |
-| 环境变量 | `export MCP_API_KEY=your-secret` |
-
-未配置 API Key 时，SSE 模式启动会打印警告，**所有请求无鉴权放行**（仅建议内网使用）。
-
-Agent 侧在 `businesses` 配置中传入 `api_key`，连接时自动附加到请求头。
-
-Token 比对使用 `secrets.compare_digest()`，防止时序攻击。
-
-### 2. SQL 安全校验
-
-每条 SQL 在执行前经过完整的验证管道（见 SQL 安全管道章节），确保只读、白名单表、强制 LIMIT。
-
-### 3. 表名校验
-
-`get_table_schema`、`get_table_indexes` 等工具的 `table_name` 参数经过正则校验 `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`，防止反引号逃逸等 SQL 注入。白名单外的表直接拒绝。
-
-### 4. 查询超时
-
-每条 SQL 执行前自动设置 `SET SESSION MAX_EXECUTION_TIME = <timeout_ms>`，防止慢查询占用连接。超时时间通过 `sql_security.query_timeout`（秒）配置。
-
-### 5. 连接安全
-
-- 数据库连接使用 `readonly_user` + `autocommit=True`，确保无事务锁
-- 连接池按集群隔离，互不影响
-- 初始化使用 double-check locking 防止并发重复建池
-
-### 6. stdio 模式免鉴权
-
-stdio 模式下 MCP Server 作为本地子进程运行，通过 stdin/stdout 通信，无需网络鉴权。
-
-## SQL 安全管道
-
-每条 SQL 经过以下检查链：
-
-```
-注释剥离 → 多语句拒绝 → SELECT-only 校验 → 禁止关键字检查
-→ 禁止锁子句（FOR UPDATE / LOCK IN SHARE MODE）→ 表白名单 → LIMIT 强制
+```text
+用户输入自然语言
+  │
+  ▼
+业务选择 (single / heuristic / llm / fallback_all)
+  │
+  ▼
+构建 System Prompt
+  ├── 基础查询规则
+  ├── 业务领域知识（术语映射、表关系、状态码）
+  ├── 字段知识（自动提取的枚举含义）
+  ├── 错误记忆（历史失败经验）
+  └── 默认规则（用户偏好）
+  │
+  ▼
+LLM 生成工具调用（get_table_schema / execute_readonly_sql）
+  │
+  ▼
+执行前检查
+  ├── 打印 SQL
+  ├── 性能风险检测（索引分析 / LLM risk_note）
+  └── 高风险需用户确认
+  │
+  ▼
+调用 MCP 工具执行查询
+  │
+  ▼
+返回结果 → 自动提取字段知识 → 更新对话上下文
 ```
 
-- 只允许 SELECT 语句，拒绝所有写操作
-- 禁止 `FOR UPDATE`、`LOCK IN SHARE MODE`、`FOR SHARE`，确保快照读
-- 白名单外的表直接拒绝
-- 无 LIMIT 自动追加 `LIMIT {max_rows}`，超限自动降低
-- 数据库连接使用 `readonly_user` + `autocommit=True`
+### 业务选择策略
 
-## 性能风险检测
+| 策略 | 说明 |
+|---|---|
+| `single` | 只有一个业务，直接使用 |
+| `heuristic` | 用户输入命中业务名或显示名 |
+| `llm` | 通过 LLM 判断最相关业务 |
+| `fallback_all` | 无法唯一识别，合并所有业务的工具 |
 
-Agent 首次查询时从 MCP Server 获取白名单表的索引信息，后续每条 SQL 执行前自动分析：
+## SQL 安全
 
-| 风险等级 | 触发条件 |
-|---------|---------|
-| high | WHERE 列不在任何索引中；无 WHERE 且无 LIMIT |
-| medium | WHERE 列只命中索引非前缀列；SELECT *；LIKE '%...'；派生表 |
+### 安全管道
 
-检测到风险时打印提示，等待用户确认后才执行。
+每条 SQL 都经过多重检查：
 
-## 字段知识持久化
-
-LLM 回复中发现的枚举/状态字段含义会自动提取并持久化到 `field_knowledge.json`，下次查询时注入 system prompt，避免重复调用 `get_table_schema` 探索字段含义。
-
-提取方式（按优先级）：
-
-1. **结构化声明**（推荐）：LLM 在回复末尾输出 HTML 注释，格式固定、解析可靠
-   ```
-   <!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"1=自研,2=阿里云,5=火山"}] -->
-   ```
-2. **回退正则匹配**：从自由文本中匹配 `来源(origin): 5 = 火山` 等模式
-
-也支持手动管理：`/field tb_voice.origin 1=自研,2=阿里云`。
-
-## 错误记忆
-
-Agent 自动记录查询过程中的错误（SQL 被拒绝、表不在白名单、用户纠正等），持久化到 `error_memory.json`。下次查询时自动注入 system prompt，避免重复犯错。
-
-支持用户反馈学习：当用户输入短文本且包含纠正关键词（"不对"、"应该"等），Agent 用 LLM 提取经验教训并记录。
-
-## 项目结构
-
+```text
+注释剥离 → 多语句拒绝 → 只允许 SELECT → 禁止危险关键字
+→ 禁止锁子句 → 白名单表校验 → LIMIT 强制
 ```
+
+关键规则：
+- 只允许 `SELECT` 查询，禁止 `INSERT`/`UPDATE`/`DELETE`/`DDL`
+- 禁止 `FOR UPDATE` / `LOCK IN SHARE MODE` / `FOR SHARE`
+- 表必须在 `sql_security.allowed_tables` 白名单中
+- 无 `LIMIT` 自动补齐
+
+### MCP Server 鉴权
+
+SSE 模式支持 Bearer Token 鉴权：
+- 优先读取配置文件 `auth.api_key`
+- 其次读取环境变量 `MCP_API_KEY`
+- 未配置 API Key 时不鉴权（仅适合可信内网）
+
+### 性能风险检测
+
+执行 SQL 前会分析性能风险：
+
+| 风险级别 | 触发条件 | 处理方式 |
+|---|---|---|
+| **high** | WHERE 列无索引覆盖（全表扫描）| 需用户确认 |
+| **medium** | SELECT *、LIKE 前导通配符 | 需用户确认 |
+| **无风险** | 有索引驱动列（如主键查询）| 直接执行 |
+
+双轨检测机制：
+1. **LLM risk_note**（优先）— LLM 在调用工具时通过 `risk_note` 参数声明风险分析
+2. **静态索引分析**（兜底）— 基于 `get_table_indexes` 获取的索引信息做静态检查
+
+当 WHERE 条件有索引驱动列时（如 `WHERE app_id = 1 AND deleted_at IS NULL`，`app_id` 有索引），视为无风险，不提示。
+
+## 学习与记忆
+
+### 默认规则
+
+用户偏好持久化，自动应用到后续查询。
+
+**创建方式**：
+- `/remember 默认只查可用数据`
+- 对话中包含"记住/默认/以后都/后续查询/优先过滤"等关键词的反馈
+
+**持久化位置**：`.query-agent/<namespace>/preference_rules.json`
+
+### 错误记忆
+
+Agent 自动记录失败经验（SQL 被拒绝、表不在白名单等），注入后续 prompt 避免重犯。
+
+- 查看：`/memory`
+- 清空：`/clear [business]`
+
+**持久化位置**：`.query-agent/<namespace>/error_memory.json`
+
+### 字段知识
+
+Agent 从回答中自动提取字段枚举含义，后续查询可直接复用，无需重复查表。
+
+提取依赖 LLM 回复中的隐藏标记：
+
+```html
+<!-- FIELD_KNOWLEDGE: [{"table":"tb_voice","field":"origin","values":"1=自研,5=火山"}] -->
+```
+
+也支持从 Markdown 表格回退提取。
+
+- 手工添加：`/field tb_voice.origin 1=自研,2=阿里云,5=火山引擎`
+- 查看：`/fields`
+- 删除：`/field_rm tb_voice.origin`
+
+**持久化位置**：`.query-agent/<namespace>/field_knowledge.json`
+
+### 持久化目录
+
+所有学习数据存放在 `.query-agent/<namespace>/`，其中 `<namespace>`：
+- 优先使用 `storage.namespace` 配置
+- 否则根据配置文件路径自动推导
+
+不同配置文件使用不同 namespace，互不干扰。
+
+## 代码结构
+
+```text
 src/
-├── main.py              # CLI 入口，REPL 循环，Tab 补全，反馈检测
-├── agent.py             # QueryAgent 核心：对话循环、工具路由、字段知识提取
-├── llm_provider.py      # LLM 抽象层（Anthropic / OpenAI Compatible）
-├── business_registry.py # 多业务 MCP 连接管理（SSE 懒连接 + 会话缓存）
-├── prompts.py           # System Prompt 构建（单业务/多业务 + 字段知识注入）
-├── config.py            # YAML 配置加载 + 环境变量替换
-├── db_pool.py           # aiomysql 连接池管理
-├── sql_validator.py     # SQL 安全验证器
-├── sql_risk_checker.py  # 索引级性能风险分析
-├── error_memory.py      # 错误记忆持久化（字符预算 + 原子写入）
-├── field_knowledge.py   # 字段知识持久化 + 表结构缓存
-└── query_mcp_server.py  # MCP Server（FastMCP + Bearer Auth + 查询超时）
+  main.py                       # CLI 入口，异步 REPL 循环
+  agent.py                      # QueryAgent 核心，对话循环 + 业务路由
+  llm_provider.py               # LLM Provider 抽象（Anthropic / OpenAI Compatible）
+  prompts.py                    # System Prompt 构建
+  config.py                     # YAML 配置加载，环境变量替换
+  business_registry.py          # 多业务 MCP Server 连接管理（SSE）
+  business_selection_service.py # 业务选择（启发式 + LLM 兜底）
+  conversation_state.py         # 对话历史管理 + 压缩
+  prompt_service.py             # Prompt 组装与缓存
+  tool_execution_service.py     # 工具路由、风险检测、索引加载
+  knowledge_store.py            # 知识聚合（错误记忆 + 字段知识）
+  field_knowledge.py            # 字段知识持久化
+  error_memory.py               # 错误记忆持久化
+  preference_rules.py           # 默认规则持久化
+  query_rule_executor.py        # 规则命中与参数改写
+  query_plan.py                 # 查询计划数据结构
+  sql_validator.py              # SQL 安全验证
+  sql_risk_checker.py           # SQL 性能风险分析（索引级）
+  query_mcp_server.py           # MCP Server（stdio / SSE）
+  db_pool.py                    # MySQL 连接池管理
 ```
 
-## 开发
+## 测试
 
 ```bash
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 运行测试
+# 全量测试
 pytest
 
-# 运行单个测试
-pytest tests/test_sql_validator.py -v
+# 单文件
+pytest tests/test_agent.py -v
+
+# 单用例
+pytest tests/test_sql_validator.py::TestValidate::test_for_update_rejected
 ```
 
-## 技术栈
-
-- Python 3.10+
-- [MCP Protocol](https://modelcontextprotocol.io/) — stdio / SSE 传输
-- Anthropic SDK + OpenAI SDK — 多 LLM Provider
-- aiomysql — 异步 MySQL 连接池
-- sqlparse — SQL 解析
-- FastMCP — MCP Server 框架
-
-## License
-
-MIT
+测试使用 pytest + pytest-asyncio，所有数据库交互已 mock，无需真实数据库。

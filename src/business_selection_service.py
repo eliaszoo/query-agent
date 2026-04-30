@@ -12,6 +12,7 @@ class BusinessSelectionResult:
 
     business: object | None
     strategy: str
+    reason: str = ""
 
 
 class BusinessSelectionService:
@@ -29,20 +30,33 @@ class BusinessSelectionService:
             return BusinessSelectionResult(
                 business=businesses[0] if businesses else None,
                 strategy="single" if businesses else "fallback_all",
+                reason="只有一个可用业务，直接使用" if businesses else "没有可用业务，回退到全业务模式",
             )
 
         heuristic_match = self._heuristic_select(user_input, businesses)
         if heuristic_match is not None:
-            return BusinessSelectionResult(business=heuristic_match, strategy="heuristic")
+            return BusinessSelectionResult(
+                business=heuristic_match,
+                strategy="heuristic",
+                reason=f"用户输入命中业务名或显示名：{heuristic_match.display_name}",
+            )
 
         try:
             llm_match = self._select_with_llm(user_input, businesses)
             if llm_match is not None:
-                return BusinessSelectionResult(business=llm_match, strategy="llm")
+                return BusinessSelectionResult(
+                    business=llm_match,
+                    strategy="llm",
+                    reason=f"LLM 判断最相关业务为：{llm_match.display_name}",
+                )
         except Exception:
             logger.debug("LLM 业务选择失败，回退到全业务模式", exc_info=True)
 
-        return BusinessSelectionResult(business=None, strategy="fallback_all")
+        return BusinessSelectionResult(
+            business=None,
+            strategy="fallback_all",
+            reason="未能唯一识别目标业务，回退到全业务模式",
+        )
 
     def _heuristic_select(self, user_input: str, businesses: list):
         text = user_input.lower()

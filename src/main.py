@@ -15,6 +15,7 @@ EXIT_COMMANDS = {"exit", "quit", "q"}
 # Slash 命令定义：命令名 → (补全文本, 简短说明)
 SLASH_COMMANDS = {
     "/add":      ("/add ",      "Add business"),
+    "/business": ("/business ", "Show or lock business"),
     "/clear":    ("/clear ",    "Clear error memory"),
     "/exit":     ("/exit",      "Exit"),
     "/field":    ("/field ",    "Add field knowledge"),
@@ -24,8 +25,12 @@ SLASH_COMMANDS = {
     "/memory":   ("/memory",    "Show error memory"),
     "/new":      ("/new",       "New conversation"),
     "/pin":      ("/pin ",      "Pin context message"),
+    "/plan":     ("/plan ",     "Preview query plan"),
     "/quit":     ("/quit",      "Exit"),
+    "/remember": ("/remember ", "Save default rule"),
     "/remove":   ("/remove ",   "Remove business"),
+    "/rules":    ("/rules",     "List default rules"),
+    "/rules_clear": ("/rules_clear ", "Clear default rules"),
 }
 
 
@@ -212,6 +217,11 @@ Registered businesses:
   {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
   {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
   {_CYAN}/fields{_RESET}                             List all field knowledge
+  {_CYAN}/remember{_RESET} <rule>                    Save default query rule for current business
+  {_CYAN}/rules{_RESET}                              List default query rules
+  {_CYAN}/rules_clear{_RESET} [business]             Clear default query rules
+  {_CYAN}/business{_RESET} current|set <name>|clear  Show or lock session business
+  {_CYAN}/plan{_RESET} <query>                       Preview query plan
 """
     return f"""\
 {_BOLD}query-agent{_RESET}
@@ -227,6 +237,11 @@ Registered businesses:
   {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
   {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
   {_CYAN}/fields{_RESET}                             List all field knowledge
+  {_CYAN}/remember{_RESET} <rule>                    Save default query rule for current business
+  {_CYAN}/rules{_RESET}                              List default query rules
+  {_CYAN}/rules_clear{_RESET} [business]             Clear default query rules
+  {_CYAN}/business{_RESET} current|set <name>|clear  Show or lock session business
+  {_CYAN}/plan{_RESET} <query>                       Preview query plan
 """
 
 
@@ -273,9 +288,12 @@ def _handle_list(agent: QueryAgent) -> None:
 
 def _handle_memory(agent: QueryAgent) -> None:
     """处理 /memory 命令。"""
-    entries = agent.get_error_memory_entries()
+    entries = [
+        entry for entry in agent.get_error_memory_entries()
+        if entry.error_type != "USER_FEEDBACK"
+    ]
     if not entries:
-        print(f"  {_DIM}No error memory.{_RESET}")
+        print(f"  {_DIM}No error memory (only error lessons are shown here).{_RESET}")
         return
 
     # 按业务分组显示
@@ -303,6 +321,85 @@ def _handle_clear(agent: QueryAgent, args: list[str]) -> None:
     else:
         agent.clear_error_memory()
         print(f"  {_GREEN}Cleared{_RESET} all error memory")
+
+
+def _handle_rules(agent: QueryAgent) -> None:
+    """处理 /rules 命令。"""
+    rules = agent.list_preference_rules()
+    if not rules:
+        print(f"  {_DIM}No default query rules.{_RESET}")
+        return
+
+    for idx, rule in enumerate(rules, 1):
+        biz = rule.business or "general"
+        source = f" | source={rule.source}" if getattr(rule, "source", "") else ""
+        print(f"  {idx}. [{biz}] {rule.rule}{source}")
+
+
+def _handle_rules_clear(agent: QueryAgent, args: list[str]) -> None:
+    """处理 /rules_clear 命令。"""
+    if args:
+        biz_name = args[0]
+        agent.clear_preference_rules(biz_name)
+        print(f"  {_GREEN}Cleared{_RESET} default rules for business '{biz_name}'")
+    else:
+        agent.clear_preference_rules()
+        print(f"  {_GREEN}Cleared{_RESET} all default rules")
+
+
+def _handle_business(agent: QueryAgent, args: list[str]) -> None:
+    """处理 /business 命令。"""
+    if not args or args[0] == "current":
+        current = agent.get_locked_business()
+        if current:
+            print(f"  {_GREEN}Locked business:{_RESET} {current}")
+        else:
+            print(f"  {_DIM}No locked business in current session.{_RESET}")
+        return
+
+    action = args[0]
+    if action == "set":
+        if len(args) < 2:
+            print(f"  {_DIM}Usage: /business set <name>{_RESET}")
+            return
+        try:
+            agent.lock_business(args[1])
+            print(f"  {_GREEN}Locked business:{_RESET} {args[1]}")
+        except KeyError as e:
+            print(f"  {_RED}Error:{_RESET} {e}")
+        return
+
+    if action == "clear":
+        agent.clear_locked_business()
+        print(f"  {_GREEN}Cleared{_RESET} locked business")
+        return
+
+    print(f"  {_DIM}Usage: /business current | /business set <name> | /business clear{_RESET}")
+
+
+async def _handle_plan(agent: QueryAgent, args: list[str]) -> None:
+    """处理 /plan 命令。"""
+    query = " ".join(args).strip()
+    if not query:
+        print(f"  {_DIM}Usage: /plan <query>{_RESET}")
+        return
+
+    plan = await agent.build_query_plan(query)
+    business = plan.business or "all"
+    display_name = f" ({plan.business_display_name})" if plan.business_display_name else ""
+    print(f"  {_BOLD}Query Plan{_RESET}")
+    print(f"    business: {business}{display_name}")
+    print(f"    strategy: {plan.business_strategy or 'unknown'}")
+    if plan.business_reason:
+        print(f"    reason: {plan.business_reason}")
+    if plan.locked_business:
+        print(f"    locked: {plan.locked_business}")
+    if plan.default_cluster:
+        print(f"    default_cluster: {plan.default_cluster}")
+    if plan.active_rules:
+        print(f"    active_rules: {', '.join(plan.active_rules)}")
+    if plan.overridden_rules:
+        print(f"    overridden_rules: {', '.join(plan.overridden_rules)}")
 
 
 async def main(config_path: str = "./config.yaml") -> None:
@@ -352,6 +449,22 @@ async def main(config_path: str = "./config.yaml") -> None:
             _handle_memory(agent)
             continue
 
+        if cmd == "/rules":
+            _handle_rules(agent)
+            continue
+
+        if cmd == "/rules_clear":
+            _handle_rules_clear(agent, parts[1:])
+            continue
+
+        if cmd == "/business":
+            _handle_business(agent, parts[1:])
+            continue
+
+        if cmd == "/plan":
+            await _handle_plan(agent, parts[1:])
+            continue
+
         if cmd == "/clear":
             _handle_clear(agent, parts[1:])
             continue
@@ -386,6 +499,16 @@ async def main(config_path: str = "./config.yaml") -> None:
             business = agent.get_last_business()
             agent.add_field_knowledge(business, table, column, description)
             print(f"  {_GREEN}Added field knowledge:{_RESET} {table}.{column}: {description}")
+            continue
+
+        if cmd == "/remember":
+            rule = " ".join(parts[1:]).strip()
+            if not rule:
+                print(f"  {_DIM}Usage: /remember <default query rule>{_RESET}")
+                continue
+            business = agent.get_last_business()
+            agent.add_preference_rule(business, rule, source="manual")
+            print(f"  {_GREEN}Saved default rule:{_RESET} [{business or 'general'}] {rule}")
             continue
 
         if cmd == "/field_rm":
@@ -458,12 +581,26 @@ async def main(config_path: str = "./config.yaml") -> None:
 
         # 正常查询流程
         try:
+            active_rules = agent.list_preference_rules(agent.get_last_business())
+            if active_rules:
+                print(f"  {_DIM}Applying default rules:{_RESET}")
+                for rule in active_rules:
+                    print(f"    - {rule.rule}")
             spinner = Spinner("Thinking")
             _active_spinner = spinner
             with spinner:
                 response = await agent.run_query(user_input)
             _active_spinner = None
             print(f"\n{response}")
+
+            if agent.last_metrics and agent.last_metrics.applied_rules:
+                print(f"  {_DIM}Applied rules:{_RESET}")
+                for rule in agent.last_metrics.applied_rules:
+                    print(f"    - {rule}")
+            if agent.last_metrics and agent.last_metrics.overridden_rules:
+                print(f"  {_DIM}Overridden rules:{_RESET}")
+                for rule in agent.last_metrics.overridden_rules:
+                    print(f"    - {rule}")
 
             # 展示查询元信息
             if agent.last_metrics:
@@ -474,6 +611,8 @@ async def main(config_path: str = "./config.yaml") -> None:
                         f" | business={m.selected_business or 'unknown'}"
                         f" via {m.business_selection_strategy}"
                     )
+                if m.business_selection_reason:
+                    print(f"  {_DIM}Route:{_RESET} {m.business_selection_reason}")
                 print(
                     f"{_DIM}({m.duration_seconds}s | "
                     f"{m.input_tokens}+ {m.output_tokens}- | "

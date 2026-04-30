@@ -23,6 +23,7 @@ class PromptService:
         configured_business_knowledge: BusinessKnowledge,
         field_knowledge_manager,
         error_memory_manager,
+        preference_rules_manager,
     ) -> str:
         """构建动态 system prompt。"""
         if not self._dirty and self._cached_prompt:
@@ -50,6 +51,10 @@ class PromptService:
         if memory_prompt:
             prompt += memory_prompt
 
+        rules_prompt = preference_rules_manager.build_rules_prompt(current_business)
+        if rules_prompt:
+            prompt += rules_prompt
+
         self._cached_prompt = prompt
         self._dirty = False
         return prompt
@@ -60,6 +65,7 @@ class PromptService:
         configured_business_knowledge: BusinessKnowledge,
         field_knowledge_manager,
         error_memory_manager,
+        preference_rules_manager,
     ) -> str:
         """为单个业务构建 prompt，不使用共享缓存。"""
         knowledge = (
@@ -85,5 +91,9 @@ class PromptService:
         memory_prompt = error_memory_manager.build_memory_prompt(business_name)
         if memory_prompt:
             prompt += memory_prompt
+
+        rules_prompt = preference_rules_manager.build_rules_prompt(business_name)
+        if rules_prompt:
+            prompt += rules_prompt
 
         return prompt

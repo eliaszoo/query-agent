@@ -8,6 +8,7 @@
 import json as _json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -18,7 +19,10 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
 
 from src.business_registry import BusinessRegistry
-from src.business_selection_service import BusinessSelectionService
+from src.business_selection_service import (
+    BusinessSelectionResult,
+    BusinessSelectionService,
+)
 from src.config import (
     load_config,
     AppConfig,
@@ -31,7 +35,10 @@ from src.error_memory import ErrorMemoryManager
 from src.field_knowledge import FieldKnowledgeManager
 from src.knowledge_store import KnowledgeStore
 from src.llm_provider import LLMProvider, create_provider
+from src.preference_rules import PreferenceRulesManager
 from src.prompt_service import PromptService
+from src.query_plan import QueryPlan
+from src.query_rule_executor import QueryRuleExecutor
 from src.tool_execution_service import ToolExecutionService
 from src.sql_risk_checker import SQLRiskChecker, IndexInfo
 
@@ -64,6 +71,10 @@ class QueryMetrics:
     model: str = ""
     selected_business: str = ""
     business_selection_strategy: str = ""
+    business_selection_reason: str = ""
+    applied_rules: list[str] | None = None
+    overridden_rules: list[str] | None = None
+    query_plan: QueryPlan | None = None
 
 
 def _convert_mcp_tools_to_anthropic(mcp_tools: list) -> list[dict]:
@@ -160,9 +171,7 @@ class QueryAgent:
 
     def __init__(self, config_path: str = "./config.yaml", confirm_callback=None):
         self.config: AppConfig = load_config(config_path)
-        self._storage_namespace = (
-            self.config.storage.namespace or derive_storage_namespace(config_path)
-        )
+        self._storage_namespace = self._resolve_storage_namespace(config_path)
         self._storage_dir = self._build_storage_dir()
         self.provider: LLMProvider = create_provider(
             provider=self.config.agent.provider,
@@ -174,6 +183,9 @@ class QueryAgent:
         )
         field_knowledge = FieldKnowledgeManager(
             knowledge_path=os.path.join(self._storage_dir, "field_knowledge.json")
+        )
+        self._preference_rules = PreferenceRulesManager(
+            rules_path=os.path.join(self._storage_dir, "preference_rules.json")
         )
         self.last_metrics: Optional[QueryMetrics] = None
 
@@ -224,6 +236,35 @@ class QueryAgent:
             field_knowledge_manager=field_knowledge,
         )
 
+    def _resolve_storage_namespace(self, config_path: str) -> str:
+        """推导存储命名空间。
+
+        优先级：
+        1. storage.namespace 显式配置
+        2. 第一个业务名称（businesses 字段的 key）
+        3. business_knowledge.description（去特殊字符）
+        4. 兜底：配置文件路径哈希
+        """
+        # 1. 显式配置
+        if self.config.storage.namespace:
+            return self.config.storage.namespace
+
+        # 2. 第一个业务名称
+        if self.config.businesses:
+            first_business = next(iter(self.config.businesses))
+            return first_business
+
+        # 3. business_knowledge.description
+        desc = self.config.business_knowledge.description
+        if desc:
+            # 保留中文、字母、数字、下划线、短横线，其余替换为短横线
+            namespace = re.sub(r"[^\w\u4e00-\u9fff-]", "-", desc).strip("-")
+            if namespace:
+                return namespace
+
+        # 4. 兜底：路径哈希
+        return derive_storage_namespace(config_path)
+
     def _build_storage_dir(self) -> str:
         """构建当前配置对应的本地持久化目录。"""
         storage_dir = os.path.join(".query-agent", self._storage_namespace)
@@ -239,6 +280,7 @@ class QueryAgent:
             configured_business_knowledge=self._business_knowledge,
             field_knowledge_manager=self._knowledge_store.field_knowledge,
             error_memory_manager=self._knowledge_store.error_memory,
+            preference_rules_manager=self._preference_rules,
         )
 
     def _mark_prompt_dirty(self) -> None:
@@ -261,6 +303,20 @@ class QueryAgent:
         """置顶一条重要上下文消息，压缩时不会被截断。"""
         self._conversation.pin_message(content)
 
+    def get_locked_business(self) -> str:
+        """获取当前会话锁定的业务。"""
+        return self._conversation.locked_business
+
+    def lock_business(self, business: str) -> None:
+        """锁定当前会话业务。"""
+        if business and not self.registry.has_business(business):
+            raise KeyError(f"业务 '{business}' 不存在")
+        self._conversation.locked_business = business
+
+    def clear_locked_business(self) -> None:
+        """清除当前会话业务锁定。"""
+        self._conversation.locked_business = ""
+
     def list_businesses(self):
         """列出当前已注册业务。"""
         return self.registry.list_businesses()
@@ -276,6 +332,8 @@ class QueryAgent:
         """移除业务并清除相关缓存。"""
         await self.registry.remove(name)
         self._knowledge_store.clear_business(name)
+        if self._conversation.locked_business == name:
+            self._conversation.locked_business = ""
         if (
             self._conversation.last_query_context
             and self._conversation.last_query_context.get("business") == name
@@ -300,6 +358,27 @@ class QueryAgent:
         """清空错误记忆并失效 prompt 缓存。"""
         self._knowledge_store.clear_error_memory(business=business)
 
+    def add_preference_rule(self, business: str, rule: str, source: str = "") -> None:
+        """添加默认查询规则并失效 prompt 缓存。"""
+        parsed = self.extract_explicit_feedback_rule(rule)
+        self._preference_rules.add_rule(
+            business,
+            rule,
+            source,
+            rule_type=parsed.get("rule_type", "") if parsed else "",
+            payload=parsed.get("payload") if parsed else None,
+        )
+        self._mark_prompt_dirty()
+
+    def list_preference_rules(self, business: str = ""):
+        """列出默认查询规则。"""
+        return self._preference_rules.get_rules(business)
+
+    def clear_preference_rules(self, business: str = "") -> None:
+        """清空默认查询规则并失效 prompt 缓存。"""
+        self._preference_rules.clear(business)
+        self._mark_prompt_dirty()
+
     def get_error_memory_entries(self):
         """获取错误记忆条目。"""
         return self._knowledge_store.get_error_memory_entries()
@@ -318,6 +397,11 @@ class QueryAgent:
         self, original_query: str, business: str, user_feedback: str, lesson: str
     ) -> None:
         """记录用户反馈经验并失效 prompt 缓存。"""
+        parsed = self.extract_explicit_feedback_rule(user_feedback)
+        if parsed is not None:
+            self.add_preference_rule(business, parsed["rule"], source=user_feedback)
+            return
+
         self._knowledge_store.record_feedback(
             original_query, business, user_feedback, lesson
         )
@@ -325,6 +409,23 @@ class QueryAgent:
     @staticmethod
     def extract_explicit_feedback_lesson(user_feedback: str) -> str | None:
         """从明确的用户指令中直接提取经验，不依赖 LLM。"""
+        parsed = QueryAgent.extract_explicit_feedback_rule(user_feedback)
+        if parsed is not None:
+            return parsed["rule"]
+
+        normalized = user_feedback.strip()
+        if not normalized:
+            return None
+
+        hints = ("记住", "默认", "以后都", "后续查询", "优先过滤")
+        if not any(hint in normalized for hint in hints):
+            return None
+
+        return f"后续查询遵循用户偏好：{normalized}"
+
+    @staticmethod
+    def extract_explicit_feedback_rule(user_feedback: str) -> dict | None:
+        """从用户显式反馈中解析结构化默认规则。"""
         normalized = user_feedback.strip()
         if not normalized:
             return None
@@ -339,9 +440,85 @@ class QueryAgent:
             or "禁用" in normalized
             or "过滤" in normalized
         ):
-            return "默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。"
+            return {
+                "rule": "默认优先查询可用数据：过滤已删除和已禁用记录，除非用户明确要求查看全部或包含禁用数据。",
+                "rule_type": "available_only",
+                "payload": {"deleted_at_is_null": True, "forbidden_status": 1},
+            }
 
-        return f"后续查询遵循用户偏好：{normalized}"
+        if "测试环境" in normalized or "test集群" in normalized:
+            return {
+                "rule": "默认优先查询测试环境，除非用户明确指定生产环境。",
+                "rule_type": "default_cluster_test",
+                "payload": {"cluster": "test"},
+            }
+
+        return {
+            "rule": f"后续查询遵循用户偏好：{normalized}",
+            "rule_type": "natural_language",
+            "payload": None,
+        }
+
+    def _collect_rule_applications(self, user_input: str, business: str, arguments: dict | None = None) -> tuple[list[str], list[str], dict]:
+        rules = self.list_preference_rules(business)
+        result = QueryRuleExecutor.apply(user_input, business, rules, arguments=arguments)
+        applied = [item.description for item in result.applications if item.applied]
+        overridden = [
+            f"{item.description}（已覆盖: {item.override_reason}）"
+            for item in result.applications if item.overridden
+        ]
+        return applied, overridden, result.arguments
+
+    async def _select_business_for_query(
+        self, user_input: str
+    ) -> BusinessSelectionResult:
+        """为查询选择业务，优先使用会话锁定。"""
+        locked_business = self.get_locked_business()
+        if locked_business:
+            if self.registry.has_business(locked_business):
+                entry = self.registry.get_entry(locked_business)
+                return BusinessSelectionResult(
+                    business=entry,
+                    strategy="locked",
+                    reason=f"当前会话已锁定业务：{entry.display_name} ({entry.name})",
+                )
+            self.clear_locked_business()
+
+        return await self._business_selector.select_business(user_input)
+
+    async def build_query_plan(self, user_input: str) -> QueryPlan:
+        """构建查询计划预览。"""
+        if self._is_stdio_mode:
+            plan = QueryPlan(
+                user_input=user_input,
+                business="default",
+                business_display_name="default",
+                business_strategy="single",
+                business_reason="单业务 stdio 模式",
+                locked_business="",
+                default_cluster=self.config.agent.default_cluster,
+            )
+        else:
+            selection = await self._select_business_for_query(user_input)
+            business_name = selection.business.name if selection.business else ""
+            display_name = selection.business.display_name if selection.business else ""
+            plan = QueryPlan(
+                user_input=user_input,
+                business=business_name,
+                business_display_name=display_name,
+                business_strategy=selection.strategy,
+                business_reason=selection.reason,
+                locked_business=self.get_locked_business(),
+                default_cluster=self.config.agent.default_cluster,
+            )
+
+        rule_business = plan.business or ("default" if self._is_stdio_mode else "")
+        applied, overridden, _ = self._collect_rule_applications(
+            user_input, rule_business, arguments={"cluster": self.config.agent.default_cluster}
+        )
+        plan.active_rules = applied
+        plan.overridden_rules = overridden
+        return plan
 
     async def _ensure_knowledge_loaded(self) -> None:
         """确保所有已注册业务的领域知识已加载（用于构建 system prompt）。"""
@@ -411,8 +588,16 @@ class QueryAgent:
         metrics = QueryMetrics(model=self.config.agent.model)
 
         if self._is_stdio_mode:
+            metrics.selected_business = "default"
+            metrics.business_selection_strategy = "single"
+            metrics.business_selection_reason = "单业务 stdio 模式"
+            applied, overridden, _ = self._collect_rule_applications(user_input, "default")
+            metrics.applied_rules = applied
+            metrics.overridden_rules = overridden
+            metrics.query_plan = await self.build_query_plan(user_input)
             result = await self._run_query_stdio(user_input, metrics)
         else:
+            metrics.query_plan = await self.build_query_plan(user_input)
             result = await self._run_query_multi_business(user_input, metrics)
 
         metrics.duration_seconds = round(time.time() - start_time, 2)
@@ -446,17 +631,22 @@ class QueryAgent:
         # 确保业务知识已加载
         await self._ensure_knowledge_loaded()
 
-        selection = await self._business_selector.select_business(user_input)
+        selection = await self._select_business_for_query(user_input)
         metrics.business_selection_strategy = selection.strategy
+        metrics.business_selection_reason = selection.reason
 
         if selection.business:
             metrics.selected_business = selection.business.name
+            applied, overridden, _ = self._collect_rule_applications(user_input, selection.business.name)
+            metrics.applied_rules = applied
+            metrics.overridden_rules = overridden
             tools = await self._build_business_tools(selection.business.name)
             system_prompt = self._prompt_service.build_for_business(
                 business_entry=selection.business,
                 configured_business_knowledge=self._business_knowledge,
                 field_knowledge_manager=self._knowledge_store.field_knowledge,
                 error_memory_manager=self._knowledge_store.error_memory,
+                preference_rules_manager=self._preference_rules,
             )
             return await self._multi_business_conversation_loop(
                 tools, user_input, metrics, system_prompt
@@ -469,6 +659,8 @@ class QueryAgent:
             return "当前没有可用的业务，请先使用 /add 命令添加业务。"
 
         metrics.selected_business = "all"
+        metrics.applied_rules = []
+        metrics.overridden_rules = []
 
         # 构建包含多业务知识的 system prompt
         system_prompt = self._build_system_prompt()
@@ -580,9 +772,19 @@ class QueryAgent:
 
                 # 提前保存 business（多业务模式下 _route_tool_call 会 pop 掉）
                 tc_business = tc.arguments.get("business", "") if isinstance(tc.arguments, dict) else ""
+                tool_args = dict(tc.arguments) if isinstance(tc.arguments, dict) else {}
+                current_business = tc_business or self.get_last_business() or "default"
+                applied_rules, overridden_rules, effective_args = self._collect_rule_applications(
+                    user_input, current_business, arguments=tool_args
+                )
+                if applied_rules:
+                    metrics.applied_rules = list(dict.fromkeys((metrics.applied_rules or []) + applied_rules))
+                if overridden_rules:
+                    metrics.overridden_rules = list(dict.fromkeys((metrics.overridden_rules or []) + overridden_rules))
+                tool_args = effective_args or tool_args
 
                 # 执行前检查（打印 SQL、性能风险检测、用户确认）
-                cancel_result = await self._tool_execution.pre_execute_check(tc.name, tc.arguments)
+                cancel_result = await self._tool_execution.pre_execute_check(tc.name, tool_args)
                 if cancel_result is not None:
                     # 用户拒绝执行，直接中断对话循环
                     self._conversation.history.append(
@@ -593,22 +795,22 @@ class QueryAgent:
                     )
                     return "查询已被用户取消。"
                 else:
-                    result_text, resolved_business = await execute_tool(tc.name, tc.arguments, tc_business)
+                    result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)
                     if not tc_business and resolved_business:
                         tc_business = resolved_business
 
-                logger.info("调用工具: %s(%s)", tc.name, _sanitize_args_for_log(tc.arguments))
+                logger.info("调用工具: %s(%s)", tc.name, _sanitize_args_for_log(tool_args))
 
                 # 缓存 get_table_schema 的结果，避免重复查询
                 if tc.name == "get_table_schema":
                     self._tool_execution.cache_schema_from_result(
-                        tc.arguments, result_text, tc_business or "default"
+                        tool_args, result_text, tc_business or "default"
                     )
                     self._mark_prompt_dirty()
 
                 self._knowledge_store.check_and_record_error(
                     user_query=user_input,
-                    tool_input=tc.arguments,
+                    tool_input=tool_args,
                     result_text=result_text,
                     business=tc_business,
                     is_stdio_mode=self._is_stdio_mode,
@@ -620,8 +822,8 @@ class QueryAgent:
                     self._conversation.last_query_context = {
                         "business": tc_business or "default",
                         "query": user_input,
-                        "cluster": tc.arguments.get("cluster", "") if isinstance(tc.arguments, dict) else "",
-                        "sql": tc.arguments.get("sql", "") if isinstance(tc.arguments, dict) else "",
+                        "cluster": tool_args.get("cluster", "") if isinstance(tool_args, dict) else "",
+                        "sql": tool_args.get("sql", "") if isinstance(tool_args, dict) else "",
                     }
 
                 tool_results.append(

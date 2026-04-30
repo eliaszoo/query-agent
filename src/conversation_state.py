@@ -13,6 +13,7 @@ class ConversationState:
     history: list[dict] = field(default_factory=list)
     pinned_messages: list[dict] = field(default_factory=list)
     last_query_context: dict | None = None
+    locked_business: str = ""
 
     def clear_history(self) -> None:
         """清空对话历史，保留置顶消息。"""

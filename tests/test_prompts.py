@@ -88,6 +88,7 @@ class TestBuildSystemPromptSingleBusiness:
         assert "4. 默认查询测试集群" in prompt
         assert "5. 注意 deleted_at IS NULL" in prompt
         assert "6. 结果以表格形式呈现" in prompt
+        assert "FIELD_KNOWLEDGE: []" in prompt
 
 
 class TestBuildSystemPromptMultiBusiness:

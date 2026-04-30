@@ -32,6 +32,9 @@ class KnowledgeStore:
         r'<!--\s*FIELD_KNOWLEDGE:\s*(\[[\s\S]*?\])\s*-->',
         re.UNICODE,
     )
+    TABLE_ROW_WITH_ENUM = re.compile(r'^\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|')
+    FIELD_NAME_WITH_CODE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\)')
+    ENUM_VALUE_IN_CELL = re.compile(r'^\s*(\d+)\s*[（(]\s*([^）)]+)\s*[）)]\s*$')
 
     def __init__(
         self,
@@ -167,7 +170,7 @@ class KnowledgeStore:
     def _auto_extract_field_knowledge_fallback(
         self, response_text: str, business: str, sql: str
     ) -> None:
-        dirty = False
+        dirty = self._extract_from_markdown_table(response_text, business, sql)
 
         for match in self.FIELD_EQ_PATTERN.finditer(response_text):
             column = match.group(1)
@@ -204,6 +207,60 @@ class KnowledgeStore:
 
         if dirty:
             self._mark_prompt_dirty()
+
+    def _extract_from_markdown_table(self, response_text: str, business: str, sql: str) -> bool:
+        lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+        if len(lines) < 3:
+            return False
+
+        table = self.infer_table_from_sql(sql)
+        if not table:
+            return False
+
+        dirty = False
+        header_idx = next(
+            (
+                idx for idx, line in enumerate(lines[:-1])
+                if line.startswith("|") and idx + 1 < len(lines) and "---" in lines[idx + 1]
+            ),
+            -1,
+        )
+        if header_idx < 0:
+            return False
+
+        for row in lines[header_idx + 2:]:
+            if not row.startswith("|"):
+                break
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+
+            column = self._extract_column_from_header(cells[0])
+            if not column:
+                continue
+
+            enum_pairs = []
+            for value_cell in cells[1:]:
+                match = self.ENUM_VALUE_IN_CELL.match(value_cell)
+                if not match:
+                    continue
+                enum_pairs.append(f"{match.group(1)}={match.group(2).strip()}")
+
+            if len(enum_pairs) >= 2:
+                description = ", ".join(dict.fromkeys(enum_pairs))
+                self.field_knowledge.add_field(business, table, column, description)
+                logger.info("提取字段知识(表格): %s.%s: %s", table, column, description)
+                dirty = True
+
+        return dirty
+
+    @classmethod
+    def _extract_column_from_header(cls, header: str) -> str:
+        match = cls.FIELD_NAME_WITH_CODE.search(header)
+        if match:
+            return match.group(1)
+        simple = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", header.strip("* "))
+        return simple.group(0) if simple else ""
 
     @staticmethod
     def infer_table_from_sql(sql: str) -> str:
