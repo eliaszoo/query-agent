@@ -8,7 +8,6 @@
 import json as _json
 import logging
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -28,7 +27,6 @@ from src.config import (
     AppConfig,
     BusinessKnowledge,
     BusinessEntryConfig,
-    derive_storage_namespace,
 )
 from src.conversation_state import ConversationState
 from src.error_memory import ErrorMemoryManager
@@ -171,21 +169,10 @@ class QueryAgent:
 
     def __init__(self, config_path: str = "./config.yaml", confirm_callback=None):
         self.config: AppConfig = load_config(config_path)
-        self._storage_namespace = self._resolve_storage_namespace(config_path)
-        self._storage_dir = self._build_storage_dir()
         self.provider: LLMProvider = create_provider(
             provider=self.config.agent.provider,
             api_key=self.config.agent.api_key or None,
             base_url=self.config.agent.base_url or None,
-        )
-        error_memory = ErrorMemoryManager(
-            memory_path=os.path.join(self._storage_dir, "error_memory.json")
-        )
-        field_knowledge = FieldKnowledgeManager(
-            knowledge_path=os.path.join(self._storage_dir, "field_knowledge.json")
-        )
-        self._preference_rules = PreferenceRulesManager(
-            rules_path=os.path.join(self._storage_dir, "preference_rules.json")
         )
         self.last_metrics: Optional[QueryMetrics] = None
 
@@ -199,12 +186,26 @@ class QueryAgent:
         # 用户确认回调（默认用 input，测试时可以注入 mock）
         self._confirm_callback = confirm_callback or self._default_confirm
 
+        # 每业务独立的知识存储
+        self._knowledge_stores: dict[str, KnowledgeStore] = {}
+        self._preference_rules_managers: dict[str, PreferenceRulesManager] = {}
+
         # 多业务注册表
         self.registry = BusinessRegistry()
 
-        # 从配置加载初始业务列表
+        # 从配置加载初始业务列表并初始化存储
         for name, entry_cfg in self.config.businesses.items():
             self.registry.register(name, entry_cfg.mcp_server_url, entry_cfg.display_name, api_key=entry_cfg.api_key)
+            self._ensure_business_storage(name)
+
+        # 加载动态添加的业务（重启后恢复 /add 添加的业务）
+        self._load_dynamic_businesses()
+
+        # 数据迁移：将旧的单目录存储拆分到每业务目录
+        self._migrate_legacy_storage()
+
+        # 清理旧的 hash 命名空间空目录
+        self._cleanup_empty_config_dirs()
 
         # 本地 MCP Server 子进程启动参数（stdio 模式，仅当无远程 URL 时使用）
         self.mcp_server_params = StdioServerParameters(
@@ -218,11 +219,22 @@ class QueryAgent:
 
         # 标记是否为单业务 stdio 模式（向后兼容）
         self._is_stdio_mode = not self.config.businesses and not self.config.agent.mcp_server_url
-        self._knowledge_store = KnowledgeStore(
-            error_memory=error_memory,
-            field_knowledge=field_knowledge,
-            mark_prompt_dirty=self._mark_prompt_dirty,
-        )
+
+        # stdio 模式下需要初始化 "default" 业务存储
+        if self._is_stdio_mode:
+            self._ensure_business_storage("default")
+
+        # ToolExecutionService 需要一个 field_knowledge_manager 用于 schema 缓存
+        # 使用第一个业务的 manager，或 stdio 模式的 "default"
+        first_biz = ""
+        if self._is_stdio_mode:
+            first_biz = "default"
+        elif self.config.businesses:
+            first_biz = next(iter(self.config.businesses))
+        if first_biz:
+            default_fk = self._get_field_knowledge_manager(first_biz)
+        else:
+            default_fk = FieldKnowledgeManager(knowledge_path=os.path.join(".query-agent", "_shared", "field_knowledge.json"))
         self._business_selector = BusinessSelectionService(
             provider=self.provider,
             model=self.config.agent.model,
@@ -233,54 +245,198 @@ class QueryAgent:
             risk_checker=self._risk_checker,
             confirm_callback=self._confirm_callback,
             is_stdio_mode=self._is_stdio_mode,
-            field_knowledge_manager=field_knowledge,
+            field_knowledge_manager=default_fk,
         )
 
-    def _resolve_storage_namespace(self, config_path: str) -> str:
-        """推导存储命名空间。
+    def _ensure_business_storage(self, business: str) -> None:
+        """懒初始化业务的知识存储目录和 manager。"""
+        if business in self._knowledge_stores:
+            return
+        biz_dir = os.path.join(".query-agent", business)
+        os.makedirs(biz_dir, exist_ok=True)
+        self._knowledge_stores[business] = KnowledgeStore(
+            error_memory=ErrorMemoryManager(
+                memory_path=os.path.join(biz_dir, "error_memory.json")
+            ),
+            field_knowledge=FieldKnowledgeManager(
+                knowledge_path=os.path.join(biz_dir, "field_knowledge.json")
+            ),
+            mark_prompt_dirty=self._mark_prompt_dirty,
+        )
+        self._preference_rules_managers[business] = PreferenceRulesManager(
+            rules_path=os.path.join(biz_dir, "preference_rules.json")
+        )
 
-        优先级：
-        1. storage.namespace 显式配置
-        2. 第一个业务名称（businesses 字段的 key）
-        3. business_knowledge.description（去特殊字符）
-        4. 兜底：配置文件路径哈希
-        """
-        # 1. 显式配置
-        if self.config.storage.namespace:
-            return self.config.storage.namespace
+    def _get_knowledge_store(self, business: str) -> KnowledgeStore:
+        """获取指定业务的知识存储，自动初始化。"""
+        self._ensure_business_storage(business)
+        return self._knowledge_stores[business]
 
-        # 2. 第一个业务名称
-        if self.config.businesses:
-            first_business = next(iter(self.config.businesses))
-            return first_business
+    def _get_preference_rules_manager(self, business: str) -> PreferenceRulesManager:
+        """获取指定业务的偏好规则管理器，自动初始化。"""
+        self._ensure_business_storage(business)
+        return self._preference_rules_managers[business]
 
-        # 3. business_knowledge.description
-        desc = self.config.business_knowledge.description
-        if desc:
-            # 保留中文、字母、数字、下划线、短横线，其余替换为短横线
-            namespace = re.sub(r"[^\w\u4e00-\u9fff-]", "-", desc).strip("-")
-            if namespace:
-                return namespace
+    def _get_field_knowledge_manager(self, business: str) -> FieldKnowledgeManager:
+        """获取指定业务的字段知识管理器。"""
+        return self._get_knowledge_store(business).field_knowledge
 
-        # 4. 兜底：路径哈希
-        return derive_storage_namespace(config_path)
+    def _get_error_memory_manager(self, business: str) -> ErrorMemoryManager:
+        """获取指定业务的错误记忆管理器。"""
+        return self._get_knowledge_store(business).error_memory
 
-    def _build_storage_dir(self) -> str:
-        """构建当前配置对应的本地持久化目录。"""
-        storage_dir = os.path.join(".query-agent", self._storage_namespace)
-        os.makedirs(storage_dir, exist_ok=True)
-        return storage_dir
+    def _save_dynamic_businesses(self) -> None:
+        """将动态添加的业务保存到文件，重启后可恢复。"""
+        configured = set(self.config.businesses.keys())
+        dynamic = {}
+        for entry in self.registry.list_businesses():
+            if entry.name not in configured:
+                dynamic[entry.name] = {
+                    "mcp_server_url": entry.mcp_server_url,
+                    "display_name": entry.display_name,
+                    "api_key": entry.api_key or "",
+                }
+        path = os.path.join(".query-agent", "dynamic_businesses.json")
+        os.makedirs(".query-agent", exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _json.dump(dynamic, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
+    def _load_dynamic_businesses(self) -> None:
+        """从文件加载动态添加的业务。"""
+        path = os.path.join(".query-agent", "dynamic_businesses.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            configured = set(self.config.businesses.keys())
+            for name, info in data.items():
+                if name not in configured and not self.registry.has_business(name):
+                    self.registry.register(
+                        name,
+                        info.get("mcp_server_url", ""),
+                        info.get("display_name", name),
+                        api_key=info.get("api_key", ""),
+                    )
+                    self._ensure_business_storage(name)
+        except (_json.JSONDecodeError, TypeError, KeyError) as exc:
+            logger.warning("动态业务文件解析失败，跳过: %s", exc)
+
+    def _migrate_legacy_storage(self) -> None:
+        """将旧的单目录存储（可能包含多业务数据）拆分到每业务目录。"""
+        # 查找旧的存储目录（可能是 hash 命名空间或业务名称命名的单目录）
+        if not os.path.isdir(".query-agent"):
+            return
+
+        # 对每个可能包含多业务数据的旧目录进行迁移
+        for dirname in os.listdir(".query-agent"):
+            dirpath = os.path.join(".query-agent", dirname)
+            if not os.path.isdir(dirpath) or dirname.startswith("config-"):
+                continue  # 跳过 hash 目录和动态业务文件
+
+            # 检查是否有旧的单文件存储需要迁移
+            for filename in ("field_knowledge.json", "error_memory.json", "preference_rules.json"):
+                filepath = os.path.join(dirpath, filename)
+                if not os.path.exists(filepath):
+                    continue
+
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        data = _json.load(f)
+                except (_json.JSONDecodeError, TypeError):
+                    continue
+
+                entries = data.get("entries", [])
+                if not entries:
+                    continue
+
+                # 按业务分组
+                groups: dict[str, list] = {}
+                for entry in entries:
+                    biz = entry.get("business", "") or dirname
+                    if biz not in groups:
+                        groups[biz] = []
+                    groups[biz].append(entry)
+
+                # 如果只有一个业务且与目录名匹配，无需迁移
+                if len(groups) == 1 and dirname in groups:
+                    continue
+
+                # 将各业务的数据写入对应目录
+                for biz, biz_entries in groups.items():
+                    self._ensure_business_storage(biz)
+                    biz_path = os.path.join(".query-agent", biz, filename)
+                    # 读取目标文件已有的数据，合并
+                    existing = []
+                    if os.path.exists(biz_path):
+                        try:
+                            with open(biz_path, "r", encoding="utf-8") as f:
+                                existing_data = _json.load(f)
+                            existing = existing_data.get("entries", [])
+                        except (_json.JSONDecodeError, TypeError):
+                            existing = []
+
+                    # 合并：以目标文件已有数据为主，补充旧文件中缺失的
+                    existing_keys = {
+                        (e.get("business", ""), e.get("table", ""), e.get("column", ""))
+                        if filename == "field_knowledge.json"
+                        else (e.get("business", ""), e.get("error_type", ""), e.get("timestamp", ""))
+                        if filename == "error_memory.json"
+                        else (e.get("business", ""), e.get("rule", ""), e.get("rule_type", ""))
+                        for e in existing
+                    }
+                    merged = list(existing)
+                    for e in biz_entries:
+                        key = (
+                            (e.get("business", ""), e.get("table", ""), e.get("column", ""))
+                            if filename == "field_knowledge.json"
+                            else (e.get("business", ""), e.get("error_type", ""), e.get("timestamp", ""))
+                            if filename == "error_memory.json"
+                            else (e.get("business", ""), e.get("rule", ""), e.get("rule_type", ""))
+                        )
+                        if key not in existing_keys:
+                            merged.append(e)
+
+                    tmp_path = biz_path + ".tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        _json.dump({"entries": merged}, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, biz_path)
+
+                # 迁移完成，删除旧文件
+                os.remove(filepath)
+                logger.info("已迁移 %s 中的多业务数据到每业务目录", filepath)
+
+    def _cleanup_empty_config_dirs(self) -> None:
+        """清理旧的 hash 命名空间空目录（config-* 模式）。"""
+        base = ".query-agent"
+        if not os.path.isdir(base):
+            return
+        for d in os.listdir(base):
+            if d.startswith("config-"):
+                dp = os.path.join(base, d)
+                if os.path.isdir(dp) and not os.listdir(dp):
+                    os.rmdir(dp)
+                    logger.info("已清理空目录: %s", dp)
 
     def _build_system_prompt(self) -> str:
         """构建包含多业务知识和错误记忆的动态 System Prompt（带缓存）。"""
+        current_business = self._get_current_prompt_business()
+        # 当无明确业务时，使用第一个已注册业务或 "default"
+        if not current_business:
+            if self._is_stdio_mode:
+                current_business = "default"
+            elif self._knowledge_stores:
+                current_business = next(iter(self._knowledge_stores))
         return self._prompt_service.build(
             businesses=self.registry.list_businesses(),
             is_stdio_mode=self._is_stdio_mode,
-            current_business=self._get_current_prompt_business(),
+            current_business=current_business,
             configured_business_knowledge=self._business_knowledge,
-            field_knowledge_manager=self._knowledge_store.field_knowledge,
-            error_memory_manager=self._knowledge_store.error_memory,
-            preference_rules_manager=self._preference_rules,
+            field_knowledge_manager=self._get_field_knowledge_manager(current_business or "default"),
+            error_memory_manager=self._get_error_memory_manager(current_business or "default"),
+            preference_rules_manager=self._get_preference_rules_manager(current_business or "default"),
         )
 
     def _mark_prompt_dirty(self) -> None:
@@ -324,14 +480,17 @@ class QueryAgent:
     def add_business(
         self, name: str, mcp_server_url: str, display_name: str = "", api_key: str = ""
     ) -> None:
-        """注册新业务并失效 prompt 缓存。"""
+        """注册新业务、初始化存储并持久化。"""
         self.registry.register(name, mcp_server_url, display_name, api_key=api_key)
+        self._ensure_business_storage(name)
+        self._save_dynamic_businesses()
         self._mark_prompt_dirty()
 
     async def remove_business(self, name: str) -> None:
         """移除业务并清除相关缓存。"""
         await self.registry.remove(name)
-        self._knowledge_store.clear_business(name)
+        if name in self._knowledge_stores:
+            self._knowledge_stores[name].clear_business(name)
         if self._conversation.locked_business == name:
             self._conversation.locked_business = ""
         if (
@@ -339,29 +498,40 @@ class QueryAgent:
             and self._conversation.last_query_context.get("business") == name
         ):
             self._conversation.last_query_context = None
+        self._save_dynamic_businesses()
 
     def add_field_knowledge(
         self, business: str, table: str, column: str, description: str
     ) -> None:
         """添加字段知识并失效 prompt 缓存。"""
-        self._knowledge_store.add_field_knowledge(business, table, column, description)
+        self._get_knowledge_store(business).add_field_knowledge(business, table, column, description)
 
     def remove_field_knowledge(self, business: str, table: str, column: str) -> bool:
         """删除字段知识并在成功时失效 prompt 缓存。"""
-        return self._knowledge_store.remove_field_knowledge(business, table, column)
+        return self._get_knowledge_store(business).remove_field_knowledge(business, table, column)
 
     def list_field_knowledge(self, business: str = ""):
         """列出字段知识。"""
-        return self._knowledge_store.list_field_knowledge(business=business)
+        if business:
+            return self._get_knowledge_store(business).list_field_knowledge(business=business)
+        # 聚合所有业务的字段知识
+        result = []
+        for biz, store in self._knowledge_stores.items():
+            result.extend(store.list_field_knowledge(business=""))
+        return result
 
     def clear_error_memory(self, business: str = "") -> None:
         """清空错误记忆并失效 prompt 缓存。"""
-        self._knowledge_store.clear_error_memory(business=business)
+        if business:
+            self._get_knowledge_store(business).clear_error_memory(business=business)
+        else:
+            for store in self._knowledge_stores.values():
+                store.clear_error_memory(business="")
 
     def add_preference_rule(self, business: str, rule: str, source: str = "") -> None:
         """添加默认查询规则并失效 prompt 缓存。"""
         parsed = self.extract_explicit_feedback_rule(rule)
-        self._preference_rules.add_rule(
+        self._get_preference_rules_manager(business).add_rule(
             business,
             rule,
             source,
@@ -372,20 +542,36 @@ class QueryAgent:
 
     def list_preference_rules(self, business: str = ""):
         """列出默认查询规则。"""
-        return self._preference_rules.get_rules(business)
+        if business:
+            return self._get_preference_rules_manager(business).get_rules(business)
+        # 聚合所有业务的规则
+        result = []
+        for mgr in self._preference_rules_managers.values():
+            result.extend(mgr.get_rules(business=""))
+        return result
 
     def clear_preference_rules(self, business: str = "") -> None:
         """清空默认查询规则并失效 prompt 缓存。"""
-        self._preference_rules.clear(business)
+        if business:
+            self._get_preference_rules_manager(business).clear(business)
+        else:
+            for mgr in self._preference_rules_managers.values():
+                mgr.clear(business="")
         self._mark_prompt_dirty()
 
     def get_error_memory_entries(self):
         """获取错误记忆条目。"""
-        return self._knowledge_store.get_error_memory_entries()
+        result = []
+        for store in self._knowledge_stores.values():
+            result.extend(store.get_error_memory_entries())
+        return result
 
     def get_error_memory_businesses(self):
         """获取拥有错误记忆的业务标识。"""
-        return self._knowledge_store.get_error_memory_businesses()
+        result = set()
+        for store in self._knowledge_stores.values():
+            result.update(store.get_error_memory_businesses())
+        return list(result)
 
     def get_last_business(self) -> str:
         """获取最近一次查询所属业务。"""
@@ -402,7 +588,7 @@ class QueryAgent:
             self.add_preference_rule(business, parsed["rule"], source=user_feedback)
             return
 
-        self._knowledge_store.record_feedback(
+        self._get_knowledge_store(business).record_feedback(
             original_query, business, user_feedback, lesson
         )
 
@@ -641,12 +827,13 @@ class QueryAgent:
             metrics.applied_rules = applied
             metrics.overridden_rules = overridden
             tools = await self._build_business_tools(selection.business.name)
+            business_name = selection.business.name
             system_prompt = self._prompt_service.build_for_business(
                 business_entry=selection.business,
                 configured_business_knowledge=self._business_knowledge,
-                field_knowledge_manager=self._knowledge_store.field_knowledge,
-                error_memory_manager=self._knowledge_store.error_memory,
-                preference_rules_manager=self._preference_rules,
+                field_knowledge_manager=self._get_field_knowledge_manager(business_name),
+                error_memory_manager=self._get_error_memory_manager(business_name),
+                preference_rules_manager=self._get_preference_rules_manager(business_name),
             )
             return await self._multi_business_conversation_loop(
                 tools, user_input, metrics, system_prompt
@@ -742,9 +929,10 @@ class QueryAgent:
 
             if response.stop_reason == "end_turn":
                 # 提取字段含义（在剥离注释前）
-                self._knowledge_store.auto_extract_field_knowledge(
+                last_biz = self.get_last_business() or "default"
+                self._get_knowledge_store(last_biz).auto_extract_field_knowledge(
                     response_text=response.text,
-                    business=self.get_last_business(),
+                    business=last_biz,
                     sql=(self._conversation.last_query_context or {}).get("sql", ""),
                 )
 
@@ -801,7 +989,7 @@ class QueryAgent:
                     )
                     self._mark_prompt_dirty()
 
-                self._knowledge_store.check_and_record_error(
+                self._get_knowledge_store(tc_business or "default").check_and_record_error(
                     user_query=user_input,
                     tool_input=tool_args,
                     result_text=result_text,

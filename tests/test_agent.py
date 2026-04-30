@@ -253,8 +253,8 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        assert agent._storage_namespace == "digitalhuman"
-        assert "digitalhuman" in agent._knowledge_store.error_memory._path
+        assert "digitalhuman" in agent._knowledge_stores
+        assert "digitalhuman" in agent._get_knowledge_store("digitalhuman").error_memory._path
 
     def test_init_uses_description_as_namespace(self, tmp_path):
         config_file = tmp_path / "config.yaml"
@@ -278,11 +278,11 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        assert agent._storage_namespace == "数字人平台"
-        assert "数字人平台" in agent._knowledge_store.error_memory._path
+        # stdio mode with description: "default" business storage should be initialized
+        assert "default" in agent._knowledge_stores
 
     def test_init_falls_back_to_path_hash(self, tmp_path):
-        """无 businesses、无 description、无显式 namespace 时，兜底到路径哈希。"""
+        """无 businesses、无 description、无显式 namespace 时，使用 default 存储。"""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             """
@@ -302,9 +302,8 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        # 兜底应为 config-<hash> 格式
-        assert agent._storage_namespace.startswith("config-")
-        assert agent._storage_namespace in agent._knowledge_store.error_memory._path
+        # stdio mode: "default" business storage should be initialized
+        assert "default" in agent._knowledge_stores
 
     def test_init_uses_explicit_storage_namespace(self, tmp_path):
         config_file = tmp_path / "config.yaml"
@@ -328,8 +327,9 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        assert agent._storage_namespace == "prod-order"
-        assert "prod-order" in agent._knowledge_store.error_memory._path
+        # stdio mode: "default" business storage initialized with explicit namespace not used
+        # since we now use per-business directories
+        assert "default" in agent._knowledge_stores
 
     def test_init_creates_preference_rules_storage(self, tmp_path):
         config_file = tmp_path / "config.yaml"
@@ -858,7 +858,8 @@ businesses:
             agent = QueryAgent(config_path=str(config_file))
 
         # 使用临时目录避免测试间共享 error_memory
-        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
+        biz_store = agent._get_knowledge_store("digitalhuman")
+        biz_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
         ))
 
@@ -869,7 +870,7 @@ businesses:
             "error_message": "表 xxx 不在白名单中",
         })
 
-        agent._knowledge_store.check_and_record_error(
+        biz_store.check_and_record_error(
             user_query="查数字人",
             tool_input={"business": "digitalhuman", "sql": "SELECT * FROM xxx"},
             result_text=result_text,
@@ -904,7 +905,8 @@ agent:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
+        default_store = agent._get_knowledge_store("default")
+        default_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
         ))
 
@@ -915,7 +917,7 @@ agent:
             "error_message": "包含写操作",
         })
 
-        agent._knowledge_store.check_and_record_error(
+        default_store.check_and_record_error(
             user_query="查数据",
             tool_input={"sql": "DELETE FROM tb_scene"},
             result_text=result_text,
@@ -957,7 +959,8 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
+        default_store = agent._get_knowledge_store("default")
+        default_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
         ))
 
@@ -968,7 +971,7 @@ agent:
             "error_message": "集群 'test' 连接失败",
         })
 
-        agent._knowledge_store.check_and_record_error(
+        default_store.check_and_record_error(
             user_query="查数据",
             tool_input={"sql": "SELECT 1"},
             result_text=result_text,
@@ -1000,7 +1003,8 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
+        default_store = agent._get_knowledge_store("default")
+        default_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
         ))
 
@@ -1011,7 +1015,7 @@ agent:
             "error_message": "环境变量未设置",
         })
 
-        agent._knowledge_store.check_and_record_error(
+        default_store.check_and_record_error(
             user_query="查数据",
             tool_input={"sql": "SELECT 1"},
             result_text=result_text,
@@ -1043,7 +1047,8 @@ agent:
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
-        agent._knowledge_store.set_error_memory(ErrorMemoryManager(
+        default_store = agent._get_knowledge_store("default")
+        default_store.set_error_memory(ErrorMemoryManager(
             memory_path=str(tmp_path / "error_memory.json")
         ))
 
@@ -1054,7 +1059,7 @@ agent:
             "error_message": "语法错误",
         })
 
-        agent._knowledge_store.check_and_record_error(
+        default_store.check_and_record_error(
             user_query="查数据",
             tool_input={"sql": "SELECT name FROM tb_scene"},
             result_text=result_text,
@@ -1387,15 +1392,17 @@ agent:
         fk_path = str(tmp_path / "field_knowledge.json")
         from src.field_knowledge import FieldKnowledgeManager
         field_knowledge = FieldKnowledgeManager(knowledge_path=fk_path)
-        agent._knowledge_store.set_field_knowledge(field_knowledge)
+        default_store = agent._get_knowledge_store("default")
+        default_store.set_field_knowledge(field_knowledge)
         agent._tool_execution.set_field_knowledge_manager(field_knowledge)
         return agent
 
     @staticmethod
     def _extract(agent: QueryAgent, response_text: str) -> None:
-        agent._knowledge_store.auto_extract_field_knowledge(
+        default_store = agent._get_knowledge_store("default")
+        default_store.auto_extract_field_knowledge(
             response_text=response_text,
-            business=agent.get_last_business(),
+            business=agent.get_last_business() or "default",
             sql=(agent._conversation.last_query_context or {}).get("sql", ""),
         )
 
@@ -1539,11 +1546,13 @@ businesses:
             agent = QueryAgent(config_path=str(config_file))
 
         from src.field_knowledge import FieldKnowledgeManager
-        field_knowledge = FieldKnowledgeManager(
-            knowledge_path=str(tmp_path / "field_knowledge.json")
-        )
-        agent._knowledge_store.set_field_knowledge(field_knowledge)
-        agent._tool_execution.set_field_knowledge_manager(field_knowledge)
+        # Use per-business temp files
+        dh_fk_path = str(tmp_path / "dh_field_knowledge.json")
+        order_fk_path = str(tmp_path / "order_field_knowledge.json")
+        dh_fk = FieldKnowledgeManager(knowledge_path=dh_fk_path)
+        order_fk = FieldKnowledgeManager(knowledge_path=order_fk_path)
+        agent._get_knowledge_store("digitalhuman").set_field_knowledge(dh_fk)
+        agent._get_knowledge_store("order").set_field_knowledge(order_fk)
         agent.add_field_knowledge("digitalhuman", "tb_voice", "origin", "1=自研")
         agent.add_field_knowledge("order", "tb_voice", "origin", "1=订单")
 
