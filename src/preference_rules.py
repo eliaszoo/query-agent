@@ -90,7 +90,11 @@ class PreferenceRulesManager:
     def get_rules(self, business: str = "") -> list[PreferenceRule]:
         if not business:
             return list(self._store.entries)
-        return [entry for entry in self._store.entries if entry.business == business]
+        # 同时返回通用规则（business 为空）和指定业务的规则
+        return [
+            entry for entry in self._store.entries
+            if not entry.business or entry.business == business
+        ]
 
     def clear(self, business: str = "") -> None:
         if not business:

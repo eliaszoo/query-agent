@@ -159,8 +159,13 @@ class ToolExecutionService:
         return None
 
     async def route_tool_call(self, tool_name: str, arguments: dict) -> str:
-        """路由工具调用到对应业务的 MCP Server。"""
-        business = arguments.pop("business", None)
+        """路由工具调用到对应业务的 MCP Server。
+
+        不修改传入的 arguments，提取 business 后过滤传递给 MCP。
+        """
+        business = arguments.get("business", "")
+        # 过滤掉 business 参数，不修改原 dict
+        filtered_args = {k: v for k, v in arguments.items() if k != "business"}
 
         if not business:
             return json.dumps({
@@ -178,7 +183,7 @@ class ToolExecutionService:
             }, ensure_ascii=False)
 
         try:
-            return await self._registry.call_tool(business, tool_name, arguments)
+            return await self._registry.call_tool(business, tool_name, filtered_args)
         except Exception as e:
             logger.error("业务 '%s' 工具调用失败: %s", business, e, exc_info=True)
             return json.dumps({

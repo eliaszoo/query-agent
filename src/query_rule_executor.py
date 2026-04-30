@@ -45,16 +45,18 @@ class QueryRuleExecutor:
                     result.arguments["sql"] = cls._apply_available_only_sql(
                         result.arguments["sql"], payload
                     )
-                result.applications.append(
-                    RuleApplication(
-                        business=business,
-                        rule_type=rule_type,
-                        description=rule_text or "默认只查可用数据",
-                        applied=not override_available_only,
-                        overridden=override_available_only,
-                        override_reason="用户本次明确要求查看全部/禁用/已删除数据" if override_available_only else "",
+                # 只在 execute_readonly_sql 调用时记录应用结果（非 SQL 工具无意义）
+                if result.arguments.get("sql") or override_available_only:
+                    result.applications.append(
+                        RuleApplication(
+                            business=business,
+                            rule_type=rule_type,
+                            description=rule_text or "默认只查可用数据",
+                            applied=not override_available_only and bool(result.arguments.get("sql")),
+                            overridden=override_available_only,
+                            override_reason="用户本次明确要求查看全部/禁用/已删除数据" if override_available_only else "",
+                        )
                     )
-                )
                 continue
 
             if rule_type == "default_cluster_test":

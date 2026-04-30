@@ -1021,8 +1021,8 @@ agent:
         entries = agent.get_error_memory_entries()
         assert len(entries) == 0
 
-    async def test_query_error_not_recorded(self, tmp_path):
-        """QUERY_ERROR（SQL 语法错误）不记录 — Agent 应先查表结构。"""
+    async def test_query_error_is_recorded(self, tmp_path):
+        """QUERY_ERROR（SQL 语法错误）应被记录，避免 Agent 重复犯错。"""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             """
@@ -1062,7 +1062,8 @@ agent:
         )
 
         entries = agent.get_error_memory_entries()
-        assert len(entries) == 0
+        assert len(entries) == 1
+        assert entries[0].error_type == "QUERY_ERROR"
 
 
 class TestExtractFeedbackLesson:

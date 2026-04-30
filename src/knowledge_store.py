@@ -118,7 +118,6 @@ class KnowledgeStore:
             "CONFIG_ERROR",
             "POOL_ERROR",
             "TIMEOUT_ERROR",
-            "QUERY_ERROR",
         }
         if error_type in skip_error_types:
             logger.debug("跳过错误，不记录: %s - %s", error_type, error_message)

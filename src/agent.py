@@ -751,13 +751,10 @@ class QueryAgent:
                 # 剥离 FIELD_KNOWLEDGE 注释，不展示给用户
                 display_text = KnowledgeStore.FIELD_KNOWLEDGE_TAG.sub('', response.text).rstrip()
 
-                # 保存到对话历史（保留注释供后续提取）
-                self._conversation.history.append(
-                    {"role": "user", "content": user_input}
-                )
-                self._conversation.history.append(
-                    {"role": "assistant", "content": response.text}
-                )
+                # 将完整的 messages（包含工具调用过程）同步回对话历史
+                # messages 已包含 user_input + 工具调用过程 + 最终回复
+                messages.append({"role": "assistant", "content": response.text})
+                self._conversation.history = messages
 
                 return display_text
 
@@ -786,13 +783,9 @@ class QueryAgent:
                 # 执行前检查（打印 SQL、性能风险检测、用户确认）
                 cancel_result = await self._tool_execution.pre_execute_check(tc.name, tool_args)
                 if cancel_result is not None:
-                    # 用户拒绝执行，直接中断对话循环
-                    self._conversation.history.append(
-                        {"role": "user", "content": user_input}
-                    )
-                    self._conversation.history.append(
-                        {"role": "assistant", "content": "查询已被用户取消。"}
-                    )
+                    # 用户拒绝执行，保存已有的对话过程到历史
+                    messages.append({"role": "assistant", "content": "查询已被用户取消。"})
+                    self._conversation.history = messages
                     return "查询已被用户取消。"
                 else:
                     result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)

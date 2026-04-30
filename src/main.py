@@ -194,6 +194,26 @@ def _likely_feedback(text: str) -> bool:
     return any(kw in text for kw in _FEEDBACK_KEYWORDS)
 
 
+_SLASH_HELP = f"""\
+{_DIM}Slash commands (Tab to autocomplete):{_RESET}
+  {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
+  {_CYAN}/remove{_RESET} <name>                    Remove business
+  {_CYAN}/list{_RESET}                             List businesses
+  {_CYAN}/memory{_RESET}                           Show error memory (grouped by business)
+  {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
+  {_CYAN}/new{_RESET}                              Start new conversation
+  {_CYAN}/pin{_RESET} <message>                     Pin important context (survives history compression)
+  {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
+  {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
+  {_CYAN}/fields{_RESET}                             List all field knowledge
+  {_CYAN}/remember{_RESET} <rule>                    Save default query rule for current business
+  {_CYAN}/rules{_RESET}                              List default query rules
+  {_CYAN}/rules_clear{_RESET} [business]             Clear default query rules
+  {_CYAN}/business{_RESET} current|set <name>|clear  Show or lock session business
+  {_CYAN}/plan{_RESET} <query>                       Preview query plan
+"""
+
+
 def _build_welcome_message(businesses: list = None) -> str:
     """根据业务列表构建欢迎信息。"""
     businesses = businesses or []
@@ -206,43 +226,11 @@ def _build_welcome_message(businesses: list = None) -> str:
 Registered businesses:
 {biz_list}
 
-{_DIM}Slash commands (Tab to autocomplete):{_RESET}
-  {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
-  {_CYAN}/remove{_RESET} <name>                    Remove business
-  {_CYAN}/list{_RESET}                             List businesses
-  {_CYAN}/memory{_RESET}                           Show error memory (grouped by business)
-  {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
-  {_CYAN}/new{_RESET}                              Start new conversation
-  {_CYAN}/pin{_RESET} <message>                     Pin important context (survives history compression)
-  {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
-  {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
-  {_CYAN}/fields{_RESET}                             List all field knowledge
-  {_CYAN}/remember{_RESET} <rule>                    Save default query rule for current business
-  {_CYAN}/rules{_RESET}                              List default query rules
-  {_CYAN}/rules_clear{_RESET} [business]             Clear default query rules
-  {_CYAN}/business{_RESET} current|set <name>|clear  Show or lock session business
-  {_CYAN}/plan{_RESET} <query>                       Preview query plan
-"""
+{_SLASH_HELP}"""
     return f"""\
 {_BOLD}query-agent{_RESET}
 
-{_DIM}Slash commands (Tab to autocomplete):{_RESET}
-  {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
-  {_CYAN}/remove{_RESET} <name>                    Remove business
-  {_CYAN}/list{_RESET}                             List businesses
-  {_CYAN}/memory{_RESET}                           Show error memory (grouped by business)
-  {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
-  {_CYAN}/new{_RESET}                              Start new conversation
-  {_CYAN}/pin{_RESET} <message>                     Pin important context (survives history compression)
-  {_CYAN}/field{_RESET} <table>.<col> <desc>         Add field knowledge
-  {_CYAN}/field_rm{_RESET} <table>.<col>             Remove field knowledge
-  {_CYAN}/fields{_RESET}                             List all field knowledge
-  {_CYAN}/remember{_RESET} <rule>                    Save default query rule for current business
-  {_CYAN}/rules{_RESET}                              List default query rules
-  {_CYAN}/rules_clear{_RESET} [business]             Clear default query rules
-  {_CYAN}/business{_RESET} current|set <name>|clear  Show or lock session business
-  {_CYAN}/plan{_RESET} <query>                       Preview query plan
-"""
+{_SLASH_HELP}"""
 
 
 async def _handle_add(agent: QueryAgent, args: list[str]) -> None:

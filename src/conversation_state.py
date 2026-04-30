@@ -50,7 +50,16 @@ class ConversationState:
             if role == "assistant":
                 text = self.extract_text_from_content(content)
                 if text:
-                    compressed.append({"role": "assistant", "content": f"[历史] {text[:200]}"})
+                    # 保留更多内容：SQL 查询结果通常较长，截取前 500 字符
+                    # 优先保留第一行（通常是结论/摘要）
+                    first_line = text.split("\n", 1)[0]
+                    if len(first_line) > 500:
+                        summary = first_line[:500] + "..."
+                    elif len(text) > 500:
+                        summary = first_line + "\n..."
+                    else:
+                        summary = text
+                    compressed.append({"role": "assistant", "content": f"[历史] {summary}"})
             elif role == "user" and isinstance(content, str):
                 compressed.append({"role": "user", "content": content})
 
