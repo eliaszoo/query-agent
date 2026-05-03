@@ -585,8 +585,11 @@ async def main(config_path: str = "./config.yaml") -> None:
                 print(f"  {_DIM}Usage: /remember <default query rule>{_RESET}")
                 continue
             business = agent.get_last_business()
+            if not business:
+                print(f"  {_YELLOW}No business context.{_RESET} Run a query first or use {_CYAN}/business set <name>{_RESET} to lock a business.")
+                continue
             agent.add_preference_rule(business, rule, source="manual")
-            print(f"  {_GREEN}Saved default rule:{_RESET} [{business or 'general'}] {rule}")
+            print(f"  {_GREEN}Saved default rule:{_RESET} [{business}] {rule}")
             continue
 
         if cmd == "/field_rm":
@@ -633,6 +636,15 @@ async def main(config_path: str = "./config.yaml") -> None:
 
         if cmd == "/list":
             _handle_list(agent)
+            continue
+
+        # 未知 slash 命令拦截
+        if cmd.startswith("/"):
+            similar = [c for c in SLASH_COMMANDS if c.startswith(cmd)]
+            if similar:
+                print(f"  {_YELLOW}Unknown command:{_RESET} {cmd}  {_DIM}(Did you mean: {', '.join(similar)}?){_RESET}")
+            else:
+                print(f"  {_YELLOW}Unknown command:{_RESET} {cmd}  {_DIM}(Type Tab for available commands){_RESET}")
             continue
 
         # 检测用户反馈：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正

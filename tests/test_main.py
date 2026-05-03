@@ -498,6 +498,36 @@ class TestMainLoop:
         assert "digitalhuman" in captured.out
         assert "默认只查可用数据" in captured.out
 
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    @patch("src.main.PromptSession")
+    async def test_unknown_slash_command_with_similar(self, mock_session_cls, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent_cls.return_value = MagicMock()
+        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/li", "exit"])
+
+        await main()
+
+        captured = capsys.readouterr()
+        assert "Unknown command" in captured.out
+        assert "/list" in captured.out
+
+    @pytest.mark.asyncio
+    @patch("src.main.load_config")
+    @patch("src.main.QueryAgent")
+    @patch("src.main.PromptSession")
+    async def test_unknown_slash_command_no_similar(self, mock_session_cls, mock_agent_cls, mock_load_config, capsys):
+        mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
+        mock_agent_cls.return_value = MagicMock()
+        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/xyz", "exit"])
+
+        await main()
+
+        captured = capsys.readouterr()
+        assert "Unknown command" in captured.out
+        assert "Tab" in captured.out
+
 
 class TestMainEntry:
     """Test the sync entry point wrapper."""

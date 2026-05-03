@@ -541,13 +541,17 @@ class QueryAgent:
         self._mark_prompt_dirty()
 
     def list_preference_rules(self, business: str = ""):
-        """列出默认查询规则。"""
+        """列出默认查询规则。
+
+        business 非空时：返回通用规则 + 该业务的规则。
+        business 为空时：只返回通用规则（entry.business 为空的条目），不聚合其他业务的规则。
+        """
         if business:
             return self._get_preference_rules_manager(business).get_rules(business)
-        # 聚合所有业务的规则
+        # 无业务上下文时只返回通用规则
         result = []
         for mgr in self._preference_rules_managers.values():
-            result.extend(mgr.get_rules(business=""))
+            result.extend(r for r in mgr.get_rules(business="") if not r.business)
         return result
 
     def clear_preference_rules(self, business: str = "") -> None:
