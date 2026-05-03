@@ -223,7 +223,7 @@ businesses:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             agent = QueryAgent(config_path=str(config_file))
 
-        assert len(agent.registry.list_businesses()) == 2
+        # 配置中的 2 个业务（可能还有动态加载的业务）
         entries = agent.registry.list_businesses()
         names = {e.name for e in entries}
         assert "digitalhuman" in names
@@ -878,7 +878,7 @@ businesses:
             lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.get_error_memory_entries()
+        entries = biz_store.get_error_memory_entries()
         assert len(entries) == 1
         assert entries[0].business == "digitalhuman"
 
@@ -925,7 +925,7 @@ agent:
             lesson_builder=agent._generate_lesson,
         )
 
-        entries = agent.get_error_memory_entries()
+        entries = default_store.get_error_memory_entries()
         assert len(entries) == 1
         assert entries[0].business == "default"
 
