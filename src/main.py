@@ -2,86 +2,167 @@
 
 import argparse
 import asyncio
-import readline
 import sys
 import threading
 import time
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
+from prompt_toolkit.styles import Style
 
 from src.agent import QueryAgent
 from src.config import load_config
 
 EXIT_COMMANDS = {"exit", "quit", "q"}
 
-# Slash 命令定义：命令名 → (补全文本, 简短说明)
+# Slash 命令定义：命令名 → (补全文本, 简短说明, 参数提示)
 SLASH_COMMANDS = {
-    "/add":      ("/add ",      "Add business"),
-    "/business": ("/business ", "Show or lock business"),
-    "/clear":    ("/clear ",    "Clear error memory"),
-    "/exit":     ("/exit",      "Exit"),
-    "/field":    ("/field ",    "Add field knowledge"),
-    "/field_rm": ("/field_rm ", "Remove field knowledge"),
-    "/fields":   ("/fields",    "List field knowledge"),
-    "/list":     ("/list",      "List businesses"),
-    "/memory":   ("/memory",    "Show error memory"),
-    "/new":      ("/new",       "New conversation"),
-    "/pin":      ("/pin ",      "Pin context message"),
-    "/plan":     ("/plan ",     "Preview query plan"),
-    "/quit":     ("/quit",      "Exit"),
-    "/remember": ("/remember ", "Save default rule"),
-    "/remove":   ("/remove ",   "Remove business"),
-    "/rules":    ("/rules",     "List default rules"),
-    "/rules_clear": ("/rules_clear ", "Clear default rules"),
+    "/add":         ("/add ",      "Add business",          "<name> <sse_url> [display] [key]"),
+    "/business":    ("/business ", "Show or lock business", "current|set <name>|clear"),
+    "/clear":       ("/clear ",    "Clear error memory",    "[business]"),
+    "/exit":        ("/exit",      "Exit",                  ""),
+    "/field":       ("/field ",    "Add field knowledge",   "<table>.<col> <desc>"),
+    "/field_rm":    ("/field_rm ", "Remove field knowledge","<table>.<col>"),
+    "/fields":      ("/fields",    "List field knowledge",  ""),
+    "/list":        ("/list",      "List businesses",       ""),
+    "/memory":      ("/memory",    "Show error memory",     ""),
+    "/new":         ("/new",       "New conversation",      ""),
+    "/pin":         ("/pin ",      "Pin context message",   "<message>"),
+    "/plan":        ("/plan ",     "Preview query plan",    "<query>"),
+    "/quit":        ("/quit",      "Exit",                  ""),
+    "/remember":    ("/remember ", "Save default rule",     "<rule>"),
+    "/remove":      ("/remove ",   "Remove business",       "<name>"),
+    "/rules":       ("/rules",     "List default rules",    ""),
+    "/rules_clear": ("/rules_clear ", "Clear default rules","[business]"),
 }
 
 
-def _slash_completer(text: str, state: int):
-    """readline 补全函数：输入 / 时列出匹配的命令，显示简短说明。"""
-    # 只对以 / 开头的输入进行补全
-    line = readline.get_line_buffer().lstrip()
-    if not line.startswith("/"):
-        return None
+class SlashCommandCompleter(Completer):
+    """prompt_toolkit 补全器：支持命令名补全 + 动态参数补全。"""
 
-    matches = [cmd for cmd in SLASH_COMMANDS if cmd.startswith(text)]
-    if state < len(matches):
-        # 返回补全文本（带空格的命令表示需要参数）
-        return SLASH_COMMANDS[matches[state]][0]
-    return None
+    def __init__(self, agent: QueryAgent | None = None):
+        self.agent = agent
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor.lstrip()
+        if not text.startswith("/"):
+            return
+
+        parts = text.split()
+        cmd = parts[0] if parts else ""
+
+        # 正在输入命令名（命令尚未完整）
+        if len(parts) <= 1 and not text.endswith(" "):
+            for name, (_, desc, usage) in SLASH_COMMANDS.items():
+                if name.startswith(cmd):
+                    meta = desc
+                    if usage:
+                        meta = f"{desc}  {usage}"
+                    yield Completion(
+                        name,
+                        start_position=-len(cmd),
+                        display=name,
+                        display_meta=meta,
+                        style="class:slash-command",
+                    )
+            return
+
+        # 命令已完整，提供参数补全
+        if cmd in SLASH_COMMANDS:
+            word = document.get_word_before_cursor(WORD=True)
+            arg_index = len(parts) - 1
+            if text.endswith(" "):
+                arg_index += 1
+                word = ""
+
+            for candidate in self._dynamic_completions(cmd, arg_index, word):
+                yield Completion(
+                    candidate,
+                    start_position=-len(word),
+                )
+
+    def _dynamic_completions(self, cmd: str, arg_index: int, text: str) -> list[str]:
+        """根据命令和参数位置返回动态补全候选列表。"""
+        agent = self.agent
+        if agent is None:
+            return []
+
+        if cmd == "/business" and arg_index == 1:
+            return [c for c in ["current", "set", "clear"] if c.startswith(text)]
+
+        if cmd == "/business" and arg_index == 2:
+            names = [e.name for e in agent.registry.list_businesses()]
+            return [n for n in names if n.startswith(text)]
+
+        if cmd in ("/remove",) and arg_index == 1:
+            names = [e.name for e in agent.registry.list_businesses()]
+            return [n for n in names if n.startswith(text)]
+
+        if cmd in ("/clear", "/rules_clear") and arg_index == 1:
+            names = [e.name for e in agent.registry.list_businesses()]
+            return [n for n in names if n.startswith(text)]
+
+        if cmd in ("/field_rm",) and arg_index == 1:
+            entries = agent.list_field_knowledge()
+            keys = [f"{e.table}.{e.column}" for e in entries]
+            return [k for k in keys if k.startswith(text)]
+
+        return []
 
 
-def _display_hook(substitutions, matches, longest_hit_len):
-    """自定义补全显示：每条命令附带说明。"""
-    if not matches:
-        return
+class GhostTextProcessor(Processor):
+    """在已识别的 slash 命令后显示灰色参数提示（ghost text）。
 
-    # matches 可能是补全文本（带空格），我们需要映射回命令名
-    cmd_to_desc = {v[0]: v[1] for v in SLASH_COMMANDS.values()}
+    输入 `/add ` → 行尾灰色提示 `<name> <sse_url> [display] [key]`
+    输入 `/add order ` → 灰色提示缩减为 `<sse_url> [display] [key]`
+    已提供的参数会从提示中逐步扣除。
+    """
 
-    lines = []
-    for m in matches:
-        desc = cmd_to_desc.get(m, "")
-        lines.append(f"  {_CYAN}{m}{_RESET}  {_DIM}{desc}{_RESET}")
+    def __init__(self, commands: dict):
+        self.commands = commands
 
-    print()
-    print("\n".join(lines))
-    # 重新打印 prompt
-    prompt = f"\n{_BOLD}>{_RESET} "
-    readline.redisplay()
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        # 只处理最后一行（光标所在行）
+        if ti.lineno != ti.document.line_count - 1:
+            return Transformation(fragments=ti.fragments)
+
+        buf_text = ti.document.text
+        stripped = buf_text.lstrip()
+        parts = stripped.split()
+        if not parts:
+            return Transformation(fragments=ti.fragments)
+
+        cmd = parts[0]
+        if cmd not in self.commands:
+            return Transformation(fragments=ti.fragments)
+
+        usage = self.commands[cmd][2]
+        if not usage:
+            return Transformation(fragments=ti.fragments)
+
+        # 只在命令后有空格时显示 ghost text
+        if not stripped.startswith(cmd + " ") and stripped != cmd:
+            return Transformation(fragments=ti.fragments)
+
+        # 计算已输入的参数数量，扣除对应 usage tokens
+        usage_tokens = usage.split()
+        n_args = len(parts) - 1  # 去掉命令本身
+        remaining = usage_tokens[n_args:]
+
+        if not remaining:
+            return Transformation(fragments=ti.fragments)
+
+        ghost = " " + " ".join(remaining)
+        return Transformation(fragments=ti.fragments + [("class:ghost-text", ghost)])
 
 
-def _setup_readline():
-    """配置 readline 补全行为。"""
-    readline.set_completer_delims(" \t\n")
-    readline.set_completer(_slash_completer)
-    readline.set_completion_display_matches_hook(_display_hook)
-    # macOS libedit 和 GNU readline 用不同绑定
-    try:
-        readline.parse_and_bind("tab: menu-complete")
-    except Exception:
-        pass
-    try:
-        readline.parse_and_bind("bind ^I rl_complete")
-    except Exception:
-        pass
+# prompt_toolkit 样式
+_PROMPT_STYLE = Style.from_dict({
+    "prompt-symbol": "#ansicyan bold",
+    "slash-command": "#ansicyan bold",
+    "ghost-text": "#888888",
+})
 
 # 反馈检测关键词
 _FEEDBACK_KEYWORDS = {
@@ -409,16 +490,25 @@ async def main(config_path: str = "./config.yaml") -> None:
 
     print(_build_welcome_message(businesses))
 
-    _setup_readline()
-
     agent = QueryAgent(config_path=config_path, confirm_callback=_confirm_with_spinner)
+
+    completer = SlashCommandCompleter(agent)
+    ghost = GhostTextProcessor(SLASH_COMMANDS)
+    session = PromptSession(
+        completer=completer,
+        complete_while_typing=True,
+        input_processors=[ghost],
+        style=_PROMPT_STYLE,
+    )
 
     last_query = ""
     last_response = ""
 
     while True:
         try:
-            user_input = input(f"\n{_BOLD}>{_RESET} ").strip()
+            user_input = (await session.prompt_async(
+                [("", "\n"), ("class:prompt-symbol", "> "), ("", "")],
+            )).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
