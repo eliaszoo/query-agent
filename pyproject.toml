@@ -15,6 +15,9 @@ dependencies = [
     "aiomysql",
     "pyyaml",
     "prompt_toolkit",
+    "lark-oapi",
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]

@@ -90,6 +90,19 @@ class StorageConfig:
 
 
 @dataclass
+class FeishuConfig:
+    """飞书机器人配置。"""
+
+    app_id: str = ""  # 飞书应用 App ID
+    app_secret: str = ""  # 飞书应用 App Secret
+    encrypt_key: str = ""  # 事件加密 key（可选）
+    verification_token: str = ""  # 事件验证 token
+    host: str = "0.0.0.0"  # 监听地址
+    port: int = 8080  # 监听端口
+    session_ttl: int = 1800  # 会话超时（秒），默认 30 分钟
+
+
+@dataclass
 class AppConfig:
     """应用顶层配置。"""
 
@@ -100,6 +113,7 @@ class AppConfig:
     businesses: dict[str, BusinessEntryConfig] = field(default_factory=dict)
     auth: AuthConfig = field(default_factory=AuthConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    feishu: FeishuConfig = field(default_factory=FeishuConfig)
 
 
 # 环境变量占位符正则：匹配 ${VAR_NAME}
@@ -149,12 +163,13 @@ def _validate_config(raw: dict) -> None:
     if not isinstance(raw, dict):
         raise ConfigError("配置文件格式无效，应为 YAML 字典")
 
-    # 验证 clusters（当使用 businesses 多业务模式或有 mcp_server_url 时，clusters 可以为空）
+    # 验证 clusters（当使用 businesses 多业务模式、有 mcp_server_url 或飞书模式时，clusters 可以为空）
     clusters = raw.get("clusters")
     has_businesses = raw.get("businesses") and isinstance(raw.get("businesses"), dict)
     has_mcp_url = isinstance(raw.get("agent"), dict) and raw.get("agent", {}).get("mcp_server_url")
+    has_feishu = raw.get("feishu") and isinstance(raw.get("feishu"), dict) and raw.get("feishu", {}).get("app_id")
     if not clusters or not isinstance(clusters, dict):
-        if not has_businesses and not has_mcp_url:
+        if not has_businesses and not has_mcp_url and not has_feishu:
             raise ConfigError("配置缺少 'clusters' 或 clusters 为空")
     else:
         for name, cluster in clusters.items():
@@ -201,6 +216,11 @@ def _validate_config(raw: dict) -> None:
     storage = raw.get("storage")
     if storage is not None and not isinstance(storage, dict):
         raise ConfigError("'storage' 配置格式无效")
+
+    # 验证 feishu（可选但如果存在需要合法）
+    feishu = raw.get("feishu")
+    if feishu is not None and not isinstance(feishu, dict):
+        raise ConfigError("'feishu' 配置格式无效")
 
 
 def _build_app_config(raw: dict) -> AppConfig:
@@ -290,6 +310,18 @@ def _build_app_config(raw: dict) -> AppConfig:
         namespace=storage_raw.get("namespace", ""),
     )
 
+    # 构建飞书配置
+    feishu_raw = raw.get("feishu", {})
+    feishu = FeishuConfig(
+        app_id=feishu_raw.get("app_id", ""),
+        app_secret=feishu_raw.get("app_secret", ""),
+        encrypt_key=feishu_raw.get("encrypt_key", ""),
+        verification_token=feishu_raw.get("verification_token", ""),
+        host=feishu_raw.get("host", "0.0.0.0"),
+        port=int(feishu_raw.get("port", 8080)),
+        session_ttl=int(feishu_raw.get("session_ttl", 1800)),
+    )
+
     return AppConfig(
         clusters=clusters,
         sql_security=sql_security,
@@ -298,6 +330,7 @@ def _build_app_config(raw: dict) -> AppConfig:
         businesses=businesses,
         auth=auth,
         storage=storage,
+        feishu=feishu,
     )
 
 

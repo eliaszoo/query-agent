@@ -731,12 +731,24 @@ def main_entry() -> None:
     parser.add_argument(
         "--config", default="./config.yaml", help="配置文件路径"
     )
+    parser.add_argument(
+        "--mode", choices=["repl", "feishu"], default="repl",
+        help="运行模式: repl（交互式命令行，默认）或 feishu（飞书机器人）",
+    )
     args = parser.parse_args()
 
-    try:
-        asyncio.run(main(config_path=args.config))
-    except KeyboardInterrupt:
-        sys.exit(0)
+    if args.mode == "feishu":
+        from src.feishu_bot import FeishuBotService
+        try:
+            bot = FeishuBotService(config_path=args.config)
+            bot.run()
+        except KeyboardInterrupt:
+            sys.exit(0)
+    else:
+        try:
+            asyncio.run(main(config_path=args.config))
+        except KeyboardInterrupt:
+            sys.exit(0)
 
 
 if __name__ == "__main__":
