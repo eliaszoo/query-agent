@@ -22,12 +22,9 @@ agent:
 # MCP Server 列表
 # Agent 启动时自动从这些 server 发现业务和集群，无需本地配置 businesses
 mcp_servers:
-  - name: shanghai
-    url: "http://mcp-server-sh:8765/sse"
-    api_key: "${MCP_API_KEY_SH}"
-  - name: beijing
-    url: "http://mcp-server-bj:8765/sse"
-    api_key: "${MCP_API_KEY_BJ}"
+  - name: "mcp-server"
+    url: "${MCP_SERVER_URL}"
+    api_key: "${MCP_API_KEY}"
 
 # ============================================================
 # 飞书开放平台配置步骤：
