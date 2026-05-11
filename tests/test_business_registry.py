@@ -228,6 +228,24 @@ class TestFetchBusinessKnowledge:
 
         assert result.description == "数字人"
 
+    @pytest.mark.asyncio
+    async def test_fetch_knowledge_with_term_mappings_only(self):
+        """只要有 term_mappings 即使 description 为空也能加载。"""
+        registry = BusinessRegistry()
+        registry.register("digitalhuman", "http://host:8765/sse")
+
+        with patch.object(registry, "call_tool", new_callable=AsyncMock, return_value=json.dumps({
+            "description": "",
+            "term_mappings": {"模型": "tb_model 表"},
+            "table_relationships": [],
+            "status_codes": [],
+            "custom_rules": [],
+        })):
+            result = await registry.fetch_business_knowledge("digitalhuman")
+
+        assert result.term_mappings == {"模型": "tb_model 表"}
+        assert result.description == ""
+
 
 class TestCloseAll:
     @pytest.mark.asyncio

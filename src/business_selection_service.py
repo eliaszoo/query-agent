@@ -63,9 +63,22 @@ class BusinessSelectionService:
         matches = []
         for entry in businesses:
             candidates = {entry.name.lower(), entry.display_name.lower()}
-            if entry.knowledge and entry.knowledge.description:
-                candidates.add(entry.knowledge.description.lower())
-            if any(candidate and candidate in text for candidate in candidates):
+            if entry.knowledge:
+                if entry.knowledge.description:
+                    candidates.add(entry.knowledge.description.lower())
+                # 匹配 term_mappings 中的关键词（如 "形象/数字人" → 拆分匹配 "形象" 和 "数字人"）
+                for term in (entry.knowledge.term_mappings or {}):
+                    for word in term.split("/"):
+                        w = word.strip().lower()
+                        if w:
+                            candidates.add(w)
+            logger.debug("业务 '%s' heuristic candidates: %s, text: %s", entry.name, candidates, text)
+            matched = any(candidate and candidate in text for candidate in candidates)
+            logger.info("业务 '%s' heuristic matched=%s, knowledge=%s, term_mappings=%s",
+                        entry.name, matched,
+                        entry.knowledge is not None,
+                        entry.knowledge.term_mappings if entry.knowledge else None)
+            if matched:
                 matches.append(entry)
 
         if len(matches) == 1:

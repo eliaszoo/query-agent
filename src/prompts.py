@@ -26,10 +26,13 @@ def build_system_prompt(
 
     # 单业务模式（向后兼容）
     bk = next(iter(knowledge_map.values()), None) if knowledge_map else None
-    return _build_single_business_prompt(bk)
+    clusters = []
+    if businesses:
+        clusters = list(businesses[0].cluster_routing.keys())
+    return _build_single_business_prompt(bk, clusters)
 
 
-def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None = None) -> str:
+def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None = None, clusters: list[str] | None = None) -> str:
     """构建单业务 system prompt。"""
     bk = business_knowledge or BusinessKnowledge()
     description = bk.description or "业务"
@@ -42,6 +45,10 @@ def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None =
         f"- 查询{description}相关业务数据",
         "- 支持多集群跨地域查询",
     ]
+
+    if clusters:
+        parts.append("")
+        parts.append(f"## 可用集群: {', '.join(clusters)}")
 
     if bk.term_mappings:
         parts.append("")

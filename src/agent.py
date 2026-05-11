@@ -254,6 +254,9 @@ class QueryAgent:
 
         self._prompt_service = PromptService()
 
+        # 保存最近使用的 system prompt（供 /prompt 命令调试）
+        self._last_system_prompt = ""
+
         # 用户确认回调（默认用 input，测试时可以注入 mock）
         self._confirm_callback = confirm_callback or self._default_confirm
 
@@ -315,7 +318,7 @@ class QueryAgent:
         self._business_knowledge: BusinessKnowledge = self.config.business_knowledge
 
         # 标记是否为单业务 stdio 模式（向后兼容）
-        self._is_stdio_mode = not self.config.businesses and not self.config.agent.mcp_server_url
+        self._is_stdio_mode = not self.config.businesses and not self.config.agent.mcp_server_url and not self._mcp_servers
 
         # stdio 模式下需要初始化 "default" 业务存储
         if self._is_stdio_mode:
@@ -1182,6 +1185,8 @@ class QueryAgent:
 
         if system_prompt is None:
             system_prompt = self._build_system_prompt()
+
+        self._last_system_prompt = system_prompt
 
         while True:
             response = self.provider.chat(

@@ -223,9 +223,10 @@ def _validate_config(raw: dict) -> None:
     clusters = raw.get("clusters")
     has_businesses = raw.get("businesses") and isinstance(raw.get("businesses"), dict)
     has_mcp_url = isinstance(raw.get("agent"), dict) and raw.get("agent", {}).get("mcp_server_url")
+    has_mcp_servers = raw.get("mcp_servers") and isinstance(raw.get("mcp_servers"), list)
     has_feishu = raw.get("feishu") and isinstance(raw.get("feishu"), dict) and raw.get("feishu", {}).get("app_id")
     if not clusters or not isinstance(clusters, dict):
-        if not has_businesses and not has_mcp_url and not has_feishu:
+        if not has_businesses and not has_mcp_url and not has_mcp_servers and not has_feishu:
             raise ConfigError("配置缺少 'clusters' 或 clusters 为空")
     else:
         _validate_clusters(clusters)
@@ -258,6 +259,11 @@ def _validate_config(raw: dict) -> None:
     storage = raw.get("storage")
     if storage is not None and not isinstance(storage, dict):
         raise ConfigError("'storage' 配置格式无效")
+
+    # 验证 mcp_servers（可选但如果存在需要合法）
+    mcp_servers = raw.get("mcp_servers")
+    if mcp_servers is not None and not isinstance(mcp_servers, list):
+        raise ConfigError("'mcp_servers' 配置格式无效")
 
     # 验证 feishu（可选但如果存在需要合法）
     feishu = raw.get("feishu")
@@ -362,13 +368,19 @@ def _build_app_config(raw: dict) -> AppConfig:
 
     # 构建多业务知识配置（business_knowledges）
     business_knowledges: dict[str, BusinessKnowledge] = {}
-    # 如果 business_knowledge 是嵌套格式（多个业务），解析为 business_knowledges
-    if bk_raw and "description" not in bk_raw:
+    # 优先从 business_knowledges（复数）键解析
+    bk_multi_raw = raw.get("business_knowledges", {})
+    if bk_multi_raw and isinstance(bk_multi_raw, dict):
+        for biz_name, biz_bk in bk_multi_raw.items():
+            if isinstance(biz_bk, dict):
+                business_knowledges[biz_name] = _build_business_knowledge(biz_bk)
+    # 兼容：business_knowledge 嵌套格式（无 description 键）
+    if not business_knowledges and bk_raw and "description" not in bk_raw:
         # 嵌套格式：{business_name: {description, ...}}
         for biz_name, biz_bk in bk_raw.items():
             if isinstance(biz_bk, dict):
                 business_knowledges[biz_name] = _build_business_knowledge(biz_bk)
-    elif bk_raw:
+    elif not business_knowledges and bk_raw:
         # 单业务格式，放入 "default" 下
         business_knowledges["default"] = business_knowledge
 

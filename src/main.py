@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ SLASH_COMMANDS = {
     "/new":         ("/new",       "New conversation",      ""),
     "/pin":         ("/pin ",      "Pin context message",   "<message>"),
     "/plan":        ("/plan ",     "Preview query plan",    "<query>"),
+    "/prompt":      ("/prompt",    "Show system prompt",    ""),
     "/quit":        ("/quit",      "Exit",                  ""),
     "/remember":    ("/remember ", "Save default rule",     "<rule>"),
     "/remove":      ("/remove ",   "Remove MCP Server",     "<server_name>"),
@@ -280,6 +282,7 @@ _SLASH_HELP = f"""\
   {_CYAN}/add{_RESET} <name> <sse_url> [key]        Add MCP Server
   {_CYAN}/remove{_RESET} <name>                    Remove MCP Server
   {_CYAN}/list{_RESET}                             List servers & businesses
+  {_CYAN}/prompt{_RESET}                            Show current system prompt
   {_CYAN}/memory{_RESET}                           Show error memory (grouped by business)
   {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
   {_CYAN}/new{_RESET}                              Start new conversation
@@ -502,9 +505,27 @@ async def _handle_plan(agent: QueryAgent, args: list[str]) -> None:
         print(f"    overridden_rules: {', '.join(plan.overridden_rules)}")
 
 
+def _handle_prompt(agent: QueryAgent) -> None:
+    """处理 /prompt 命令：显示最近一次查询使用的 system prompt。"""
+    prompt = agent._last_system_prompt
+    if not prompt:
+        # 没有查询过，显示默认 prompt
+        prompt = agent._build_system_prompt()
+    print(f"\n{prompt}")
+    print(f"\n  {_DIM}--- end of system prompt ({len(prompt)} chars) ---{_RESET}")
+
+
 async def main(config_path: str = "./config.yaml") -> None:
     """异步主函数，运行交互式查询循环。"""
     global _active_spinner
+
+    # 配置日志：只输出 src 模块的 INFO 日志
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(name)s: %(message)s",
+    )
+    logging.getLogger("src").setLevel(logging.INFO)
+
     config = load_config(config_path)
     businesses = []
     if config.businesses:
@@ -568,6 +589,10 @@ async def main(config_path: str = "./config.yaml") -> None:
 
         if cmd == "/business":
             _handle_business(agent, parts[1:])
+            continue
+
+        if cmd == "/prompt":
+            _handle_prompt(agent)
             continue
 
         if cmd == "/plan":
@@ -726,6 +751,10 @@ async def main(config_path: str = "./config.yaml") -> None:
             # 展示查询元信息
             if agent.last_metrics:
                 m = agent.last_metrics
+                cluster_info = ""
+                ctx = agent._conversation.last_query_context
+                if ctx and ctx.get("cluster"):
+                    cluster_info = f" | cluster={ctx['cluster']}"
                 selection_info = ""
                 if m.business_selection_strategy:
                     selection_info = (
@@ -738,7 +767,7 @@ async def main(config_path: str = "./config.yaml") -> None:
                     f"{_DIM}({m.duration_seconds}s | "
                     f"{m.input_tokens}+ {m.output_tokens}- | "
                     f"{m.tool_calls} tool calls"
-                    f"{selection_info}){_RESET}"
+                    f"{selection_info}{cluster_info}){_RESET}"
                 )
 
             last_query = user_input

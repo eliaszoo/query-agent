@@ -376,8 +376,20 @@ class BusinessRegistry:
         try:
             result_text = await self.call_tool(name, "get_business_knowledge", {"business": name})
             data = json.loads(result_text)
+            logger.info(
+                "get_business_knowledge(%s): description=%s, term_mappings_keys=%s",
+                name,
+                data.get("description"),
+                list(data.get("term_mappings", {}).keys()) if isinstance(data.get("term_mappings"), dict) else None,
+            )
 
-            if isinstance(data, dict) and data.get("description"):
+            if isinstance(data, dict) and (
+                data.get("description")
+                or data.get("term_mappings")
+                or data.get("table_relationships")
+                or data.get("status_codes")
+                or data.get("custom_rules")
+            ):
                 entry.knowledge = BusinessKnowledge(
                     description=data.get("description", ""),
                     term_mappings=data.get("term_mappings", {}),

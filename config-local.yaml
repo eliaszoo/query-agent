@@ -41,21 +41,7 @@ agent:
   # api_key: "${DASHSCOPE_API_KEY}"
   # base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-# ============================================================
-# 多业务配置
-# 每个业务对应一个远程 MCP Server（SSE 模式）
-# ============================================================
-businesses:
-  digitalhuman:
-    display_name: "数字人"
-    mcp_server_url: "${DH_MCP_SERVER_URL}"
-    api_key: "${DH_MCP_API_KEY}"  # 与 MCP Server 共享的鉴权密钥
-  # 添加更多业务：
-  # order:
-  #   display_name: "订单"
-  #   mcp_server_url: "http://other-host:8765/sse"
-
 mcp_servers:
   - name: "mcp-server"
     url: "${MCP_SERVER_URL}"
-    api_key: "${MCP_SERVER_URL}"
+    api_key: "${MCP_API_KEY}"
