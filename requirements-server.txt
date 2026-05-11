@@ -3,3 +3,5 @@ mcp[cli]
 sqlparse
 aiomysql
 pyyaml
+fastapi
+uvicorn

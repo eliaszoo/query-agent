@@ -4,3 +4,7 @@ mcp[cli]
 sqlparse
 aiomysql
 pyyaml
+prompt_toolkit
+lark-oapi
+fastapi
+uvicorn
