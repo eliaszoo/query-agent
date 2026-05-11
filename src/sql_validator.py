@@ -60,8 +60,13 @@ class SQLValidator:
         r";\s*\S", re.DOTALL
     )
 
-    def __init__(self, allowed_tables: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        allowed_tables: list[str] | None = None,
+        business_allowed_tables: dict[str, list[str]] | None = None,
+    ) -> None:
         self._allowed_tables: list[str] = allowed_tables if allowed_tables is not None else []
+        self._business_allowed_tables: dict[str, list[str]] = business_allowed_tables or {}
 
     def _strip_comments(self, sql: str) -> str:
         """Remove SQL comments (-- and /* */)."""
@@ -188,7 +193,7 @@ class SQLValidator:
                 return name.strip("`'\"")
         return None
 
-    def validate(self, sql: str) -> ValidationResult:
+    def validate(self, sql: str, business: str = "") -> ValidationResult:
         """验证 SQL 安全性。
 
         检查步骤：
@@ -201,6 +206,7 @@ class SQLValidator:
 
         Args:
             sql: 待验证的 SQL 字符串。
+            business: 业务名称，用于选择对应的 allowed_tables。
 
         Returns:
             ValidationResult 实例。
@@ -260,7 +266,7 @@ class SQLValidator:
 
         # Step 4: Extract and validate table names
         tables = self._extract_table_names(working_sql)
-        allowed_set = set(self._allowed_tables)
+        allowed_set = self._get_allowed_set(business)
         if not allowed_set:
             # 白名单为空时跳过表名验证（由配置决定是否启用）
             pass
@@ -277,6 +283,22 @@ class SQLValidator:
             is_valid=True,
             sanitized_sql=working_sql,
         )
+
+    def _get_allowed_set(self, business: str = "") -> set[str]:
+        """获取指定业务的表白名单集合。
+
+        优先使用 business_allowed_tables[business]，
+        回退到全局 _allowed_tables。
+
+        Args:
+            business: 业务名称。
+
+        Returns:
+            允许查询的表名集合。
+        """
+        if business and business in self._business_allowed_tables:
+            return set(self._business_allowed_tables[business])
+        return set(self._allowed_tables)
 
     def ensure_limit(self, sql: str, max_rows: int = 100) -> str:
         """确保 SQL 包含 LIMIT 子句。

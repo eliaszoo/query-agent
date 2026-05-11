@@ -50,22 +50,21 @@ class ToolExecutionService:
         if not self._is_stdio_mode:
             for entry in self._registry.list_businesses():
                 try:
-                    clusters_text = await self._registry.call_tool(
-                        entry.name, "get_cluster_list", {}
-                    )
-                    clusters_data = json.loads(clusters_text)
-                    cluster_list = [
-                        c["name"] for c in clusters_data.get("clusters", [])
-                        if c.get("status") == "connected"
-                    ]
-                    if cluster_list:
-                        cluster = cluster_list[0]
-                        result_text = await self._registry.call_tool(
-                            entry.name, "get_table_indexes", {"cluster": cluster}
-                        )
-                        self.parse_and_cache_indexes(
-                            business=entry.name, cluster=cluster, result_text=result_text
-                        )
+                    # 使用聚合的集群路由表
+                    for cluster_name in entry.cluster_routing:
+                        try:
+                            result_text = await self._registry.call_tool(
+                                entry.name, "get_table_indexes",
+                                {"cluster": cluster_name, "business": entry.name}
+                            )
+                            self.parse_and_cache_indexes(
+                                business=entry.name, cluster=cluster_name, result_text=result_text
+                            )
+                        except Exception:
+                            logger.warning(
+                                "获取业务 '%s' 集群 '%s' 索引信息失败",
+                                entry.name, cluster_name, exc_info=True,
+                            )
                 except Exception:
                     logger.warning("获取业务 '%s' 索引信息失败", entry.name, exc_info=True)
 
@@ -158,14 +157,22 @@ class ToolExecutionService:
 
         return None
 
-    async def route_tool_call(self, tool_name: str, arguments: dict) -> str:
+    async def route_tool_call(self, tool_name: str, arguments: dict, current_business: str = "") -> str:
         """路由工具调用到对应业务的 MCP Server。
 
-        不修改传入的 arguments，提取 business 后过滤传递给 MCP。
+        优先从 arguments 中获取 business 参数；如果没有则使用 current_business 自动填充。
+        BusinessRegistry 根据 cluster 参数路由到对应地域的 MCP Server。
+        business 参数会自动注入到 arguments 中传递给 MCP Server 工具。
+
+        Args:
+            tool_name: 工具名称。
+            arguments: 工具参数（可能不含 business）。
+            current_business: 当前选定的业务名（自动填充用）。
+
+        Returns:
+            工具结果的 JSON 字符串。
         """
-        business = arguments.get("business", "")
-        # 过滤掉 business 参数，不修改原 dict
-        filtered_args = {k: v for k, v in arguments.items() if k != "business"}
+        business = arguments.get("business", "") or current_business
 
         if not business:
             return json.dumps({
@@ -182,8 +189,12 @@ class ToolExecutionService:
                 "error_message": f"业务 '{business}' 不存在，可用业务: {available}",
             }, ensure_ascii=False)
 
+        # 自动填充 business 参数（MCP Server 工具需要）
+        args_with_business = dict(arguments)
+        args_with_business["business"] = business
+
         try:
-            return await self._registry.call_tool(business, tool_name, filtered_args)
+            return await self._registry.call_tool(business, tool_name, args_with_business)
         except Exception as e:
             logger.error("业务 '%s' 工具调用失败: %s", business, e, exc_info=True)
             return json.dumps({

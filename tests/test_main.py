@@ -12,6 +12,7 @@ from src.main import (
     SlashCommandCompleter, GhostTextProcessor,
 )
 from src.business_registry import BusinessEntry
+from src.config import MCPServerEndpoint
 
 
 def _make_prompt_session(inputs):
@@ -92,15 +93,15 @@ class TestWelcomeMessage:
         assert "query-agent" in msg
 
     def test_single_business_welcome(self):
-        businesses = [BusinessEntry(name="default", display_name="数字人平台", mcp_server_url="http://a/sse")]
+        businesses = [BusinessEntry(name="default", display_name="数字人平台", servers=[MCPServerEndpoint(url="http://a/sse")])]
         msg = _build_welcome_message(businesses)
         assert "query-agent" in msg
         assert "数字人平台" not in msg
 
     def test_multi_business_welcome(self):
         businesses = [
-            BusinessEntry(name="digitalhuman", display_name="数字人", mcp_server_url="http://a/sse"),
-            BusinessEntry(name="order", display_name="订单", mcp_server_url="http://b/sse"),
+            BusinessEntry(name="digitalhuman", display_name="数字人", servers=[MCPServerEndpoint(url="http://a/sse")]),
+            BusinessEntry(name="order", display_name="订单", servers=[MCPServerEndpoint(url="http://b/sse")]),
         ]
         msg = _build_welcome_message(businesses)
         assert "multi-business" in msg
@@ -254,12 +255,14 @@ class TestMainLoop:
     async def test_add_command(self, mock_session_cls, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
+        mock_agent.add_mcp_server = AsyncMock()
+        mock_agent.list_businesses.return_value = []
         mock_agent_cls.return_value = mock_agent
-        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/add order http://host:8765/sse 订单", "exit"])
+        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/add shanghai http://host:8765/sse key123", "exit"])
 
         await main()
 
-        mock_agent.add_business.assert_called_once_with("order", "http://host:8765/sse", "订单", api_key="")
+        mock_agent.add_mcp_server.assert_called_once_with("shanghai", "http://host:8765/sse", api_key="key123")
         captured = capsys.readouterr()
         assert "Added" in captured.out
 
@@ -270,13 +273,16 @@ class TestMainLoop:
     async def test_remove_command(self, mock_session_cls, mock_agent_cls, mock_load_config, capsys):
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
-        mock_agent.remove_business = AsyncMock()
+        mock_agent.remove_mcp_server = AsyncMock()
+        server_mock = MagicMock()
+        server_mock.name = "shanghai"
+        mock_agent.mcp_servers = [server_mock]
         mock_agent_cls.return_value = mock_agent
-        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/remove order", "exit"])
+        mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/remove shanghai", "exit"])
 
         await main()
 
-        mock_agent.remove_business.assert_called_once_with("order")
+        mock_agent.remove_mcp_server.assert_called_once_with("shanghai")
         captured = capsys.readouterr()
         assert "Removed" in captured.out
 
@@ -288,8 +294,10 @@ class TestMainLoop:
         mock_load_config.return_value = MagicMock(business_knowledge=MagicMock(description=""), businesses={})
         mock_agent = MagicMock()
         mock_agent.list_businesses.return_value = [
-            BusinessEntry(name="digitalhuman", display_name="数字人", mcp_server_url="http://a/sse"),
+            BusinessEntry(name="digitalhuman", display_name="数字人", servers=[MCPServerEndpoint(url="http://a/sse")], cluster_routing={"huangpu": MCPServerEndpoint(url="http://sh:8765/sse")}),
         ]
+        mock_agent.mcp_servers = [MCPServerEndpoint(name="shanghai", url="http://sh:8765/sse")]
+        mock_agent._ensure_knowledge_loaded = AsyncMock()
         mock_agent_cls.return_value = mock_agent
         mock_session_cls.return_value.prompt_async = AsyncMock(side_effect=["/list", "exit"])
 
@@ -297,6 +305,7 @@ class TestMainLoop:
 
         captured = capsys.readouterr()
         assert "digitalhuman" in captured.out
+        assert "MCP Servers" in captured.out
 
     @pytest.mark.asyncio
     @patch("src.main.load_config")
@@ -560,7 +569,7 @@ class TestGhostTextProcessor:
         # fragments should include ghost text
         fragments = result.fragments
         text = "".join(f[1] for f in fragments)
-        assert "<name>" in text
+        assert "<server_name>" in text
 
     def test_add_with_one_arg_shrinks_hint(self):
         proc = GhostTextProcessor(SLASH_COMMANDS)
@@ -569,7 +578,7 @@ class TestGhostTextProcessor:
         fragments = result.fragments
         text = "".join(f[1] for f in fragments)
         assert "<sse_url>" in text
-        assert "<name>" not in text
+        assert "<server_name>" not in text
 
     def test_no_arg_command_no_hint(self):
         proc = GhostTextProcessor(SLASH_COMMANDS)

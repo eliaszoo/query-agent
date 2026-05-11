@@ -20,7 +20,7 @@ error_memory.json
 # claude
 .claude/
 
-env
+.env
 
 field_knowledge.json
 config-server-*.yaml

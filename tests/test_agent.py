@@ -11,8 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.agent import QueryAgent, QueryMetrics, _convert_mcp_tools_to_anthropic, _merge_tools_with_business_param
+from src.agent import QueryAgent, QueryMetrics, _convert_mcp_tools_to_anthropic, _merge_tools_with_business_param, _prepare_business_tools
 from src.business_selection_service import BusinessSelectionService
+from src.config import MCPServerEndpoint
 from src.conversation_state import ConversationState
 from src.error_memory import ErrorMemoryManager
 from src.knowledge_store import KnowledgeStore
@@ -136,6 +137,191 @@ class TestMergeToolsWithBusinessParam:
         }
         merged = _merge_tools_with_business_param(tools_per_business)
         assert [t["name"] for t in merged] == ["execute_readonly_sql"]
+
+    def test_get_business_list_excluded(self):
+        """get_business_list 工具不暴露给 LLM。"""
+        tools_per_business = {
+            "digitalhuman": [
+                {
+                    "name": "get_business_list",
+                    "description": "获取业务列表",
+                    "input_schema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "execute_readonly_sql",
+                    "description": "执行只读 SQL",
+                    "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}}, "required": ["sql"]},
+                },
+            ],
+        }
+        merged = _merge_tools_with_business_param(tools_per_business)
+        assert [t["name"] for t in merged] == ["execute_readonly_sql"]
+
+    def test_mcp_server_business_param_replaced_with_enum(self):
+        """MCP Server 工具自带 business 参数时，替换为 enum 让 LLM 选择。"""
+        tools_per_business = {
+            "digitalhuman": [
+                {
+                    "name": "execute_readonly_sql",
+                    "description": "执行只读 SQL",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "business": {"type": "string", "description": "业务标识"},
+                            "cluster": {"type": "string"},
+                            "sql": {"type": "string"},
+                        },
+                        "required": ["business", "sql"],
+                    },
+                },
+            ],
+            "order": [
+                {
+                    "name": "execute_readonly_sql",
+                    "description": "执行只读 SQL",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "business": {"type": "string", "description": "业务标识"},
+                            "cluster": {"type": "string"},
+                            "sql": {"type": "string"},
+                        },
+                        "required": ["business", "sql"],
+                    },
+                },
+            ],
+        }
+        merged = _merge_tools_with_business_param(tools_per_business)
+        props = merged[0]["input_schema"]["properties"]
+        assert props["business"]["enum"] == ["digitalhuman", "order"]
+        assert "cluster" in props
+        assert "sql" in props
+
+    def test_with_aggregated_clusters(self):
+        """aggregated_clusters 参数更新 cluster enum。"""
+        tools_per_business = {
+            "digitalhuman": [
+                {
+                    "name": "execute_readonly_sql",
+                    "description": "执行只读 SQL",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "business": {"type": "string"},
+                            "cluster": {"type": "string"},
+                            "sql": {"type": "string"},
+                        },
+                        "required": ["sql"],
+                    },
+                },
+            ],
+        }
+        merged = _merge_tools_with_business_param(
+            tools_per_business, aggregated_clusters=["huangpu", "tiantan"]
+        )
+        props = merged[0]["input_schema"]["properties"]
+        assert props["cluster"]["enum"] == ["huangpu", "tiantan"]
+
+
+class TestPrepareBusinessTools:
+    """_prepare_business_tools 测试：移除 business 参数，更新 cluster enum。"""
+
+    def test_removes_business_from_properties(self):
+        """从工具定义中移除 business 参数（agent 自动填充）。"""
+        tools = [
+            {
+                "name": "execute_readonly_sql",
+                "description": "执行只读 SQL",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "business": {"type": "string", "description": "业务标识"},
+                        "cluster": {"type": "string"},
+                        "sql": {"type": "string"},
+                    },
+                    "required": ["business", "sql"],
+                },
+            },
+        ]
+        prepared = _prepare_business_tools(tools, aggregated_clusters=["huangpu", "tiantan"])
+        assert len(prepared) == 1
+        props = prepared[0]["input_schema"]["properties"]
+        assert "business" not in props
+        assert "cluster" in props
+        assert "sql" in props
+        # business 不在 required 中
+        assert "business" not in prepared[0]["input_schema"]["required"]
+        assert "sql" in prepared[0]["input_schema"]["required"]
+
+    def test_updates_cluster_enum(self):
+        """cluster 参数的 enum 更新为聚合后的集群列表。"""
+        tools = [
+            {
+                "name": "execute_readonly_sql",
+                "description": "执行只读 SQL",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster": {"type": "string"},
+                        "sql": {"type": "string"},
+                    },
+                    "required": ["sql"],
+                },
+            },
+        ]
+        prepared = _prepare_business_tools(tools, aggregated_clusters=["huangpu", "tiantan", "production"])
+        assert prepared[0]["input_schema"]["properties"]["cluster"]["enum"] == ["huangpu", "tiantan", "production"]
+
+    def test_excludes_internal_tools(self):
+        """get_business_knowledge 和 get_business_list 不暴露给 LLM。"""
+        tools = [
+            {"name": "get_business_knowledge", "description": "", "input_schema": {"type": "object", "properties": {}}},
+            {"name": "get_business_list", "description": "", "input_schema": {"type": "object", "properties": {}}},
+            {"name": "execute_readonly_sql", "description": "执行 SQL", "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}}}},
+        ]
+        prepared = _prepare_business_tools(tools)
+        assert [t["name"] for t in prepared] == ["execute_readonly_sql"]
+
+    def test_no_aggregated_clusters_skips_cluster_enum(self):
+        """没有 aggregated_clusters 时 cluster enum 不更新。"""
+        tools = [
+            {
+                "name": "execute_readonly_sql",
+                "description": "执行 SQL",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster": {"type": "string"},
+                        "sql": {"type": "string"},
+                    },
+                    "required": ["sql"],
+                },
+            },
+        ]
+        prepared = _prepare_business_tools(tools)
+        # 没有 enum 被添加
+        assert "enum" not in prepared[0]["input_schema"]["properties"]["cluster"]
+
+    def test_tools_without_business_param_pass_through(self):
+        """没有 business 参数的工具定义不受影响。"""
+        tools = [
+            {
+                "name": "execute_readonly_sql",
+                "description": "执行 SQL",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster": {"type": "string"},
+                        "sql": {"type": "string"},
+                    },
+                    "required": ["sql"],
+                },
+            },
+        ]
+        prepared = _prepare_business_tools(tools, aggregated_clusters=["test"])
+        props = prepared[0]["input_schema"]["properties"]
+        assert "business" not in props
+        assert props["cluster"]["enum"] == ["test"]
 
 
 # ---------------------------------------------------------------------------
@@ -1708,3 +1894,81 @@ businesses:
         agent._build_merged_tools.assert_awaited_once()
         assert metrics.selected_business == "all"
         assert metrics.business_selection_strategy == "fallback_all"
+
+
+# ---------------------------------------------------------------------------
+# ToolExecutionService.route_tool_call with current_business
+# ---------------------------------------------------------------------------
+
+
+class TestRouteToolCallWithCurrentBusiness:
+    """route_tool_call 测试：current_business 自动填充 business 参数。"""
+
+    def _make_service(self) -> ToolExecutionService:
+        registry = MagicMock()
+        registry.has_business.return_value = True
+        registry.call_tool = AsyncMock(return_value='{"success": true}')
+        registry.list_businesses.return_value = []
+        risk_checker = MagicMock()
+        return ToolExecutionService(
+            registry=registry,
+            risk_checker=risk_checker,
+            confirm_callback=lambda _: True,
+            is_stdio_mode=False,
+            field_knowledge_manager=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_fills_business_from_current_business(self):
+        """arguments 中没有 business 时，使用 current_business 自动填充。"""
+        service = self._make_service()
+        result = await service.route_tool_call(
+            "execute_readonly_sql",
+            {"cluster": "huangpu", "sql": "SELECT 1"},
+            current_business="digitalhuman",
+        )
+        # 验证 call_tool 被调用时 business 已注入
+        service._registry.call_tool.assert_awaited_once()
+        call_args = service._registry.call_tool.call_args
+        assert call_args[0][0] == "digitalhuman"  # business name
+        assert call_args[0][2]["business"] == "digitalhuman"  # business injected in args
+
+    @pytest.mark.asyncio
+    async def test_uses_business_from_arguments_over_current(self):
+        """arguments 中有 business 时优先使用，不用 current_business。"""
+        service = self._make_service()
+        result = await service.route_tool_call(
+            "execute_readonly_sql",
+            {"business": "order", "cluster": "test", "sql": "SELECT 1"},
+            current_business="digitalhuman",
+        )
+        call_args = service._registry.call_tool.call_args
+        assert call_args[0][0] == "order"  # uses business from arguments
+        assert call_args[0][2]["business"] == "order"
+
+    @pytest.mark.asyncio
+    async def test_missing_business_returns_error(self):
+        """没有 business 且没有 current_business 时返回 MISSING_BUSINESS 错误。"""
+        service = self._make_service()
+        result = await service.route_tool_call(
+            "execute_readonly_sql",
+            {"sql": "SELECT 1"},
+            current_business="",
+        )
+        import json
+        data = json.loads(result)
+        assert data["error_type"] == "MISSING_BUSINESS"
+
+    @pytest.mark.asyncio
+    async def test_invalid_business_returns_error(self):
+        """business 不存在时返回 INVALID_BUSINESS 错误。"""
+        service = self._make_service()
+        service._registry.has_business.return_value = False
+        result = await service.route_tool_call(
+            "execute_readonly_sql",
+            {"business": "nonexistent", "sql": "SELECT 1"},
+            current_business="",
+        )
+        import json
+        data = json.loads(result)
+        assert data["error_type"] == "INVALID_BUSINESS"

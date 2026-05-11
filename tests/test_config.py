@@ -9,6 +9,7 @@ from src.config import (
     AppConfig,
     ClusterConfig,
     ConfigError,
+    MCPServerEndpoint,
     SQLSecurityConfig,
     AgentConfig,
     BusinessKnowledge,
@@ -529,5 +530,159 @@ auth: "invalid"
         try:
             with pytest.raises(ConfigError, match="'auth' 配置格式无效"):
                 load_config(path)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# MCPServerEndpoint + mcp_servers 配置
+# ---------------------------------------------------------------------------
+
+
+class TestMCPServersConfig:
+    """顶层 mcp_servers 配置解析测试。"""
+
+    def test_mcp_servers_parsed_from_top_level(self):
+        """顶层 mcp_servers 数组正确解析。"""
+        yaml_content = """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+mcp_servers:
+  - name: shanghai
+    url: "http://mcp-sh:8765/sse"
+    api_key: "key-sh"
+  - name: beijing
+    url: "http://mcp-bj:8765/sse"
+    api_key: "key-bj"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            config = load_config(path)
+            assert len(config.mcp_servers) == 2
+            assert config.mcp_servers[0].name == "shanghai"
+            assert config.mcp_servers[0].url == "http://mcp-sh:8765/sse"
+            assert config.mcp_servers[1].name == "beijing"
+        finally:
+            os.unlink(path)
+
+    def test_businesses_reference_server_names(self):
+        """业务配置引用 server 名称，不重复 URL。"""
+        yaml_content = """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+mcp_servers:
+  - name: shanghai
+    url: "http://mcp-sh:8765/sse"
+    api_key: "key-sh"
+  - name: beijing
+    url: "http://mcp-bj:8765/sse"
+    api_key: "key-bj"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    servers: [shanghai, beijing]
+  copyright_music:
+    display_name: "版权音乐"
+    servers: [shanghai, beijing]
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            config = load_config(path)
+            assert config.businesses["digitalhuman"].servers == ["shanghai", "beijing"]
+            assert config.businesses["copyright_music"].servers == ["shanghai", "beijing"]
+        finally:
+            os.unlink(path)
+
+    def test_backward_compat_mcp_server_url(self):
+        """旧格式 mcp_server_url 自动创建 default server 和业务。"""
+        yaml_content = """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+agent:
+  model: "test"
+  mcp_server_url: "http://mcp:8765/sse"
+  mcp_api_key: "key123"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            config = load_config(path)
+            assert len(config.mcp_servers) == 1
+            assert config.mcp_servers[0].name == "default"
+            assert config.mcp_servers[0].url == "http://mcp:8765/sse"
+            assert config.businesses["default"].servers == ["default"]
+        finally:
+            os.unlink(path)
+
+    def test_backward_compat_business_servers_dict(self):
+        """旧格式 businesses.servers 为 dict 列表时，自动提取到 mcp_servers。"""
+        yaml_content = """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+businesses:
+  digitalhuman:
+    display_name: "数字人"
+    servers:
+      - url: "http://mcp-sh:8765/sse"
+        api_key: "key-sh"
+      - url: "http://mcp-bj:8765/sse"
+        api_key: "key-bj"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            config = load_config(path)
+            # dict 列表自动提取为 mcp_server，引用用 auto 名称
+            assert len(config.mcp_servers) == 2
+            assert config.mcp_servers[0].url == "http://mcp-sh:8765/sse"
+            assert config.mcp_servers[1].url == "http://mcp-bj:8765/sse"
+            # business servers 为 auto 名称引用
+            assert len(config.businesses["digitalhuman"].servers) == 2
+            assert config.businesses["digitalhuman"].servers[0].startswith("auto-")
+        finally:
+            os.unlink(path)
+
+    def test_mcp_server_string_url(self):
+        """mcp_servers 支持纯 URL 字符串简写。"""
+        yaml_content = """
+clusters:
+  test:
+    description: "测试"
+    host: "localhost"
+    port: 3306
+    database: "testdb"
+    user: "root"
+    password: "pass"
+mcp_servers:
+  - "http://mcp:8765/sse"
+"""
+        path = _write_yaml(yaml_content)
+        try:
+            config = load_config(path)
+            assert len(config.mcp_servers) == 1
+            assert config.mcp_servers[0].url == "http://mcp:8765/sse"
+            assert config.mcp_servers[0].name == "server-0"
         finally:
             os.unlink(path)

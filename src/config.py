@@ -39,6 +39,7 @@ class SQLSecurityConfig:
     max_rows: int = 100
     query_timeout: int = 30
     allowed_tables: list[str] = field(default_factory=list)
+    business_allowed_tables: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -66,13 +67,24 @@ class AgentConfig:
 
 
 @dataclass
+class MCPServerEndpoint:
+    """单个 MCP Server 端点配置。"""
+
+    name: str = ""  # server 标识，如 "shanghai"（顶层 mcp_servers 引用用）
+    url: str = ""  # MCP Server SSE URL
+    api_key: str = ""  # 鉴权密钥，为空则不传鉴权 Header
+
+
+@dataclass
 class BusinessEntryConfig:
     """单个业务的配置（用于多业务模式）。"""
 
     name: str  # 业务标识，如 "digitalhuman"
     display_name: str  # 显示名，如 "数字人"
-    mcp_server_url: str  # MCP Server SSE URL
-    api_key: str = ""  # MCP Server 鉴权密钥，为空则不传鉴权 Header
+    servers: list[str] = field(default_factory=list)  # server 名称引用列表（对应 mcp_servers 中的 name）
+    # 向后兼容字段
+    mcp_server_url: str = ""  # 单 MCP Server SSE URL（旧格式）
+    api_key: str = ""  # 单 MCP Server 鉴权密钥（旧格式）
 
 
 @dataclass
@@ -107,9 +119,12 @@ class AppConfig:
     """应用顶层配置。"""
 
     clusters: dict[str, ClusterConfig] = field(default_factory=dict)
+    business_clusters: dict[str, dict[str, ClusterConfig]] = field(default_factory=dict)
+    mcp_servers: list[MCPServerEndpoint] = field(default_factory=list)  # 顶层 MCP Server 列表
     sql_security: SQLSecurityConfig = field(default_factory=SQLSecurityConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     business_knowledge: BusinessKnowledge = field(default_factory=BusinessKnowledge)
+    business_knowledges: dict[str, BusinessKnowledge] = field(default_factory=dict)
     businesses: dict[str, BusinessEntryConfig] = field(default_factory=dict)
     auth: AuthConfig = field(default_factory=AuthConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -151,6 +166,47 @@ def _substitute_env_vars(value: Any) -> Any:
     return value
 
 
+def _validate_cluster_entry(name: str, cluster: dict) -> None:
+    """验证单个集群配置项。"""
+    for req_field in _REQUIRED_CLUSTER_FIELDS:
+        if req_field not in cluster or cluster[req_field] is None:
+            raise ConfigError(f"集群 '{name}' 缺少必填字段: '{req_field}'")
+    for str_field in ("host", "password"):
+        val = cluster.get(str_field, "")
+        if isinstance(val, str) and _ENV_VAR_PATTERN.search(val):
+            raise ConfigError(
+                f"集群 '{name}' 的 '{str_field}' 包含未解析的环境变量: {val}"
+            )
+
+
+def _validate_clusters(clusters: dict) -> None:
+    """验证 clusters 配置，支持扁平（单业务）和多业务嵌套两种格式。
+
+    扁平格式：clusters = {cluster_name: {host, port, ...}}
+    嵌套格式：clusters = {business_name: {cluster_name: {host, port, ...}}}
+
+    通过检测第一个值是否包含 _REQUIRED_CLUSTER_FIELDS 来区分格式。
+    """
+    # 检测是否为嵌套格式（多业务）
+    first_value = next(iter(clusters.values()), None)
+    if isinstance(first_value, dict):
+        # 如果第一个值包含集群必填字段 → 扁平格式
+        if any(k in first_value for k in _REQUIRED_CLUSTER_FIELDS):
+            for name, cluster in clusters.items():
+                if not isinstance(cluster, dict):
+                    raise ConfigError(f"集群 '{name}' 配置格式无效")
+                _validate_cluster_entry(name, cluster)
+        else:
+            # 嵌套格式：business_name → {cluster_name → config}
+            for biz_name, biz_clusters in clusters.items():
+                if not isinstance(biz_clusters, dict):
+                    raise ConfigError(f"业务 '{biz_name}' 集群配置格式无效")
+                for cluster_name, cluster in biz_clusters.items():
+                    if not isinstance(cluster, dict):
+                        raise ConfigError(f"业务 '{biz_name}' 集群 '{cluster_name}' 配置格式无效")
+                    _validate_cluster_entry(cluster_name, cluster)
+
+
 def _validate_config(raw: dict) -> None:
     """验证配置完整性。
 
@@ -163,7 +219,7 @@ def _validate_config(raw: dict) -> None:
     if not isinstance(raw, dict):
         raise ConfigError("配置文件格式无效，应为 YAML 字典")
 
-    # 验证 clusters（当使用 businesses 多业务模式、有 mcp_server_url 或飞书模式时，clusters 可以为空）
+    # 验证 clusters（支持扁平和多业务嵌套两种格式）
     clusters = raw.get("clusters")
     has_businesses = raw.get("businesses") and isinstance(raw.get("businesses"), dict)
     has_mcp_url = isinstance(raw.get("agent"), dict) and raw.get("agent", {}).get("mcp_server_url")
@@ -172,21 +228,7 @@ def _validate_config(raw: dict) -> None:
         if not has_businesses and not has_mcp_url and not has_feishu:
             raise ConfigError("配置缺少 'clusters' 或 clusters 为空")
     else:
-        for name, cluster in clusters.items():
-            if not isinstance(cluster, dict):
-                raise ConfigError(f"集群 '{name}' 配置格式无效")
-            for req_field in _REQUIRED_CLUSTER_FIELDS:
-                if req_field not in cluster or cluster[req_field] is None:
-                    raise ConfigError(
-                        f"集群 '{name}' 缺少必填字段: '{req_field}'"
-                    )
-            # 验证环境变量占位符是否已被替换
-            for str_field in ("host", "password"):
-                val = cluster.get(str_field, "")
-                if isinstance(val, str) and _ENV_VAR_PATTERN.search(val):
-                    raise ConfigError(
-                        f"集群 '{name}' 的 '{str_field}' 包含未解析的环境变量: {val}"
-                    )
+        _validate_clusters(clusters)
 
     # 验证 sql_security（可选但如果存在需要合法）
     sql_sec = raw.get("sql_security")
@@ -223,6 +265,33 @@ def _validate_config(raw: dict) -> None:
         raise ConfigError("'feishu' 配置格式无效")
 
 
+def _build_cluster_config(name: str, c: dict) -> ClusterConfig:
+    """从字典构建单个 ClusterConfig。"""
+    return ClusterConfig(
+        name=name,
+        description=c.get("description", ""),
+        host=c["host"],
+        port=int(c["port"]),
+        database=c["database"],
+        user=c["user"],
+        password=c["password"],
+        charset=c.get("charset", "utf8mb4"),
+        max_connections=int(c.get("max_connections", 5)),
+        connect_timeout=int(c.get("connect_timeout", 10)),
+    )
+
+
+def _build_business_knowledge(bk_raw: dict) -> BusinessKnowledge:
+    """从原始字典构建 BusinessKnowledge。"""
+    return BusinessKnowledge(
+        description=bk_raw.get("description", ""),
+        term_mappings=bk_raw.get("term_mappings", {}),
+        table_relationships=bk_raw.get("table_relationships", []),
+        status_codes=bk_raw.get("status_codes", []),
+        custom_rules=bk_raw.get("custom_rules", []),
+    )
+
+
 def _build_app_config(raw: dict) -> AppConfig:
     """从原始字典构建类型安全的 AppConfig。
 
@@ -232,28 +301,47 @@ def _build_app_config(raw: dict) -> AppConfig:
     Returns:
         AppConfig 实例。
     """
-    # 构建集群配置（当使用 businesses 多业务模式时，clusters 可以为空）
+    # 构建集群配置（支持扁平和多业务嵌套两种格式）
     clusters: dict[str, ClusterConfig] = {}
-    for name, c in raw.get("clusters", {}).items():
-        clusters[name] = ClusterConfig(
-            name=name,
-            description=c.get("description", ""),
-            host=c["host"],
-            port=int(c["port"]),
-            database=c["database"],
-            user=c["user"],
-            password=c["password"],
-            charset=c.get("charset", "utf8mb4"),
-            max_connections=int(c.get("max_connections", 5)),
-            connect_timeout=int(c.get("connect_timeout", 10)),
+    business_clusters: dict[str, dict[str, ClusterConfig]] = {}
+    clusters_raw = raw.get("clusters", {})
+    if clusters_raw:
+        # 检测格式：嵌套 or 扁平
+        first_value = next(iter(clusters_raw.values()), None)
+        is_nested = (
+            isinstance(first_value, dict)
+            and not any(k in first_value for k in _REQUIRED_CLUSTER_FIELDS)
         )
+        if is_nested:
+            # 嵌套格式：{business: {cluster: config}}
+            for biz_name, biz_clusters in clusters_raw.items():
+                biz_cc: dict[str, ClusterConfig] = {}
+                for c_name, c in biz_clusters.items():
+                    cc = _build_cluster_config(c_name, c)
+                    biz_cc[c_name] = cc
+                    clusters[c_name] = cc  # 扁平视图，向后兼容
+                business_clusters[biz_name] = biz_cc
+        else:
+            # 扁平格式：{cluster: config}，放入 "default" 业务下
+            for name, c in clusters_raw.items():
+                cc = _build_cluster_config(name, c)
+                clusters[name] = cc
+            if clusters:
+                business_clusters["default"] = dict(clusters)
 
     # 构建 SQL 安全配置
     sql_sec_raw = raw.get("sql_security", {})
+    business_allowed_tables: dict[str, list[str]] = {}
+    bat_raw = sql_sec_raw.get("business_allowed_tables", {})
+    if isinstance(bat_raw, dict):
+        for biz_name, tables in bat_raw.items():
+            if isinstance(tables, list):
+                business_allowed_tables[biz_name] = tables
     sql_security = SQLSecurityConfig(
         max_rows=int(sql_sec_raw.get("max_rows", 100)),
         query_timeout=int(sql_sec_raw.get("query_timeout", 30)),
         allowed_tables=sql_sec_raw.get("allowed_tables", []),
+        business_allowed_tables=business_allowed_tables,
     )
 
     # 构建 Agent 配置
@@ -270,31 +358,85 @@ def _build_app_config(raw: dict) -> AppConfig:
 
     # 构建业务知识配置
     bk_raw = raw.get("business_knowledge", {})
-    business_knowledge = BusinessKnowledge(
-        description=bk_raw.get("description", ""),
-        term_mappings=bk_raw.get("term_mappings", {}),
-        table_relationships=bk_raw.get("table_relationships", []),
-        status_codes=bk_raw.get("status_codes", []),
-        custom_rules=bk_raw.get("custom_rules", []),
-    )
+    business_knowledge = _build_business_knowledge(bk_raw)
+
+    # 构建多业务知识配置（business_knowledges）
+    business_knowledges: dict[str, BusinessKnowledge] = {}
+    # 如果 business_knowledge 是嵌套格式（多个业务），解析为 business_knowledges
+    if bk_raw and "description" not in bk_raw:
+        # 嵌套格式：{business_name: {description, ...}}
+        for biz_name, biz_bk in bk_raw.items():
+            if isinstance(biz_bk, dict):
+                business_knowledges[biz_name] = _build_business_knowledge(biz_bk)
+    elif bk_raw:
+        # 单业务格式，放入 "default" 下
+        business_knowledges["default"] = business_knowledge
+
+    # 构建顶层 MCP Server 列表
+    mcp_servers: list[MCPServerEndpoint] = []
+    mcp_servers_raw = raw.get("mcp_servers", [])
+    if isinstance(mcp_servers_raw, list):
+        for i, s in enumerate(mcp_servers_raw):
+            if isinstance(s, dict):
+                mcp_servers.append(MCPServerEndpoint(
+                    name=s.get("name", f"server-{i}"),
+                    url=s.get("url", ""),
+                    api_key=s.get("api_key", ""),
+                ))
+            elif isinstance(s, str):
+                # 简写：直接是 URL 字符串
+                mcp_servers.append(MCPServerEndpoint(
+                    name=f"server-{i}",
+                    url=s,
+                    api_key="",
+                ))
 
     # 构建多业务配置
     businesses: dict[str, BusinessEntryConfig] = {}
     businesses_raw = raw.get("businesses", {})
     for biz_name, biz_cfg in businesses_raw.items():
+        servers_raw = biz_cfg.get("servers", [])
+
+        # servers 支持两种格式：
+        # 1. 名称引用列表: ["shanghai", "beijing"]  → list[str]
+        # 2. 旧格式 dict 列表: [{url, api_key}]     → 自动提取到 mcp_servers，替换为名称引用
+        server_refs: list[str] = []
+        if isinstance(servers_raw, list):
+            for s in servers_raw:
+                if isinstance(s, str):
+                    # 名称引用格式
+                    server_refs.append(s)
+                elif isinstance(s, dict):
+                    # 旧格式：自动提取为顶层 mcp_server
+                    auto_name = f"auto-{biz_name}-{len(mcp_servers)}"
+                    mcp_servers.append(MCPServerEndpoint(
+                        name=auto_name,
+                        url=s.get("url", ""),
+                        api_key=s.get("api_key", ""),
+                    ))
+                    server_refs.append(auto_name)
+
         businesses[biz_name] = BusinessEntryConfig(
             name=biz_name,
             display_name=biz_cfg.get("display_name", biz_name),
+            servers=server_refs,
             mcp_server_url=biz_cfg.get("mcp_server_url", ""),
             api_key=biz_cfg.get("api_key", ""),
         )
 
-    # 向后兼容：如果配置了 agent.mcp_server_url 但没有 businesses，
-    # 自动转为名为 "default" 的单业务条目
-    if not businesses and agent.mcp_server_url:
+    # 向后兼容：如果配置了 agent.mcp_server_url 但没有 businesses 和 mcp_servers，
+    # 自动创建 default server 和 default 业务
+    if not businesses and not mcp_servers and agent.mcp_server_url:
+        default_server = MCPServerEndpoint(
+            name="default",
+            url=agent.mcp_server_url,
+            api_key=agent_raw.get("mcp_api_key", ""),
+        )
+        mcp_servers.append(default_server)
         businesses["default"] = BusinessEntryConfig(
             name="default",
             display_name=business_knowledge.description or "默认业务",
+            servers=["default"],
             mcp_server_url=agent.mcp_server_url,
             api_key=agent_raw.get("mcp_api_key", ""),
         )
@@ -324,9 +466,12 @@ def _build_app_config(raw: dict) -> AppConfig:
 
     return AppConfig(
         clusters=clusters,
+        business_clusters=business_clusters,
+        mcp_servers=mcp_servers,
         sql_security=sql_security,
         agent=agent,
         business_knowledge=business_knowledge,
+        business_knowledges=business_knowledges,
         businesses=businesses,
         auth=auth,
         storage=storage,

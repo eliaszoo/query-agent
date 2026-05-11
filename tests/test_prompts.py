@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.config import BusinessKnowledge
+from src.config import BusinessKnowledge, MCPServerEndpoint
 from src.business_registry import BusinessEntry
 from src.prompts import build_system_prompt
 
@@ -90,6 +90,11 @@ class TestBuildSystemPromptSingleBusiness:
         assert "6. 结果以表格形式呈现" in prompt
         assert "FIELD_KNOWLEDGE: []" in prompt
 
+    def test_single_business_mentions_cross_region(self):
+        """单业务 prompt 提到跨地域查询。"""
+        prompt = build_system_prompt()
+        assert "多集群跨地域查询" in prompt
+
 
 class TestBuildSystemPromptMultiBusiness:
     """多业务模式 build_system_prompt() 函数测试。"""
@@ -97,8 +102,8 @@ class TestBuildSystemPromptMultiBusiness:
     def test_multi_business_prompt_has_business_list(self):
         """多业务 prompt 包含业务列表。"""
         businesses = [
-            BusinessEntry(name="digitalhuman", display_name="数字人", mcp_server_url="http://a/sse"),
-            BusinessEntry(name="order", display_name="订单", mcp_server_url="http://b/sse"),
+            BusinessEntry(name="digitalhuman", display_name="数字人", servers=[MCPServerEndpoint(url="http://a/sse")]),
+            BusinessEntry(name="order", display_name="订单", servers=[MCPServerEndpoint(url="http://b/sse")]),
         ]
         prompt = build_system_prompt(businesses=businesses)
         assert "多业务数据查询助手" in prompt
@@ -111,8 +116,8 @@ class TestBuildSystemPromptMultiBusiness:
     def test_multi_business_with_knowledge(self):
         """多业务 prompt 包含各业务领域知识。"""
         businesses = [
-            BusinessEntry(name="digitalhuman", display_name="数字人", mcp_server_url="http://a/sse"),
-            BusinessEntry(name="order", display_name="订单", mcp_server_url="http://b/sse"),
+            BusinessEntry(name="digitalhuman", display_name="数字人", servers=[MCPServerEndpoint(url="http://a/sse")]),
+            BusinessEntry(name="order", display_name="订单", servers=[MCPServerEndpoint(url="http://b/sse")]),
         ]
         knowledge_map = {
             "digitalhuman": BusinessKnowledge(
@@ -133,8 +138,27 @@ class TestBuildSystemPromptMultiBusiness:
     def test_multi_business_rules_require_business_param(self):
         """多业务模式的查询规则要求指定 business 参数。"""
         businesses = [
-            BusinessEntry(name="a", display_name="A", mcp_server_url="http://a/sse"),
-            BusinessEntry(name="b", display_name="B", mcp_server_url="http://b/sse"),
+            BusinessEntry(name="a", display_name="A", servers=[MCPServerEndpoint(url="http://a/sse")]),
+            BusinessEntry(name="b", display_name="B", servers=[MCPServerEndpoint(url="http://b/sse")]),
         ]
         prompt = build_system_prompt(businesses=businesses)
         assert "必须指定 business 参数" in prompt
+
+    def test_multi_business_shows_clusters(self):
+        """多业务 prompt 展示聚合后的集群列表。"""
+        businesses = [
+            BusinessEntry(
+                name="digitalhuman",
+                display_name="数字人",
+                servers=[MCPServerEndpoint(url="http://sh:8765/sse")],
+                cluster_routing={"huangpu": MCPServerEndpoint(url="http://sh:8765/sse")},
+            ),
+            BusinessEntry(
+                name="order",
+                display_name="订单",
+                servers=[MCPServerEndpoint(url="http://a/sse")],
+            ),
+        ]
+        prompt = build_system_prompt(businesses=businesses)
+        assert "huangpu" in prompt
+        assert "集群" in prompt

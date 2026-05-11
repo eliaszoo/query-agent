@@ -19,17 +19,15 @@ agent:
   provider: "anthropic"
   api_key: "${ANTHROPIC_API_KEY}"
 
-# 多业务配置（通过 SSE 连接远程 MCP Server）
-businesses:
-  digitalhuman:
-    name: "digitalhuman"
-    display_name: "数字人"
-    mcp_server_url: "http://mcp-server:8765/sse"  # MCP Server SSE URL
-    api_key: "${MCP_API_KEY}"                       # MCP Server 鉴权密钥
-
-# 业务领域知识（可选，如果 MCP Server 已配置则可省略）
-business_knowledge:
-  description: "数字人平台"
+# MCP Server 列表
+# Agent 启动时自动从这些 server 发现业务和集群，无需本地配置 businesses
+mcp_servers:
+  - name: shanghai
+    url: "http://mcp-server-sh:8765/sse"
+    api_key: "${MCP_API_KEY_SH}"
+  - name: beijing
+    url: "http://mcp-server-bj:8765/sse"
+    api_key: "${MCP_API_KEY_BJ}"
 
 # ============================================================
 # 飞书开放平台配置步骤：
@@ -41,4 +39,9 @@ business_knowledge:
 # 5. 配置 Encrypt Key 和 Verification Token
 # 6. 发布应用，在群聊中添加机器人
 # 7. 在群聊中 @机器人 发送查询消息
+#
+# 业务发现机制：
+# - Agent 启动时自动调用每个 MCP Server 的 get_business_list
+# - 发现业务后自动注册并获取集群路由
+# - 不需要在本地配置 businesses 段
 # ============================================================

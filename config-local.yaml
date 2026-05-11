@@ -54,3 +54,8 @@ businesses:
   # order:
   #   display_name: "订单"
   #   mcp_server_url: "http://other-host:8765/sse"
+
+mcp_servers:
+  - name: "mcp-server"
+    url: "${MCP_SERVER_URL}"
+    api_key: "${MCP_SERVER_URL}"

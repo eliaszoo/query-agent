@@ -94,8 +94,64 @@ def _convert_mcp_tools_to_anthropic(mcp_tools: list) -> list[dict]:
     return tools
 
 
+def _prepare_business_tools(
+    tools: list[dict],
+    aggregated_clusters: list[str] | None = None,
+) -> list[dict]:
+    """准备单业务工具列表：移除 business 参数（agent 自动填充），更新 cluster enum。
+
+    MCP Server 的工具自带 business 参数，但 LLM 不需要填写它。
+    agent 侧 route_tool_call 会根据当前业务自动填充 business。
+    同时将 cluster 参数的 enum 更新为聚合后的全地域集群列表。
+
+    Args:
+        tools: MCP Server 返回的工具列表。
+        aggregated_clusters: 聚合后的集群名列表。
+
+    Returns:
+        处理后的工具定义列表。
+    """
+    prepared = []
+    for tool in tools:
+        name = tool["name"]
+
+        # get_business_knowledge 和 get_business_list 不暴露给 LLM
+        if name in ("get_business_knowledge", "get_business_list"):
+            continue
+
+        # 深拷贝 schema
+        schema = _json.loads(_json.dumps(tool.get("input_schema", {})))
+        if schema.get("type") != "object":
+            schema = {"type": "object", "properties": {}}
+
+        properties = schema.get("properties", {})
+        required = list(schema.get("required", []))
+
+        # 移除 business 参数（agent 自动填充）
+        if "business" in properties:
+            del properties["business"]
+        if "business" in required:
+            required.remove("business")
+
+        # 更新 cluster enum（聚合所有地域的集群）
+        if aggregated_clusters and "cluster" in properties:
+            properties["cluster"]["enum"] = aggregated_clusters
+
+        schema["properties"] = properties
+        schema["required"] = required
+
+        prepared.append({
+            "name": name,
+            "description": tool["description"],
+            "input_schema": schema,
+        })
+
+    return prepared
+
+
 def _merge_tools_with_business_param(
     tools_per_business: dict[str, list[dict]],
+    aggregated_clusters: list[str] | None = None,
 ) -> list[dict]:
     """合并多个业务的工具定义，注入 business 参数。
 
@@ -104,13 +160,15 @@ def _merge_tools_with_business_param(
     - get_cluster_list(business)
     - get_table_schema(business, cluster, table_name)
 
-    get_business_knowledge 不暴露给 LLM（仅在初始化时内部调用）。
+    MCP Server 工具自带 business 参数，这里将其改为 enum 让 LLM 选择业务。
+    get_business_knowledge 和 get_business_list 不暴露给 LLM。
 
     Args:
         tools_per_business: 业务名 → 该业务的工具列表。
+        aggregated_clusters: 聚合后的集群名列表（跨地域）。
 
     Returns:
-        合并后的工具定义列表（包含 business 参数）。
+        合并后的工具定义列表（包含 business enum 参数）。
     """
     # 用第一个业务的工具作为模板
     first_tools = next(iter(tools_per_business.values()), [])
@@ -128,23 +186,36 @@ def _merge_tools_with_business_param(
     for tool in first_tools:
         name = tool["name"]
 
-        # get_business_knowledge 不暴露给 LLM
-        if name == "get_business_knowledge":
+        # get_business_knowledge 和 get_business_list 不暴露给 LLM
+        if name in ("get_business_knowledge", "get_business_list"):
             continue
 
-        # 深拷贝 schema 并注入 business 参数
+        # 深拷贝 schema
         schema = _json.loads(_json.dumps(tool.get("input_schema", {})))
         if schema.get("type") != "object":
             schema = {"type": "object", "properties": {}}
 
         properties = schema.get("properties", {})
-        required = schema.get("required", [])
+        required = list(schema.get("required", []))
 
-        # 在最前面插入 business 参数
-        new_properties = {"business": biz_enum}
-        new_properties.update(properties)
-        schema["properties"] = new_properties
-        schema["required"] = ["business"] + required
+        # MCP Server 工具自带 business 参数，改为 enum 让 LLM 选择
+        if "business" in properties:
+            properties["business"] = biz_enum
+        else:
+            # 在最前面插入 business 参数（向后兼容旧 MCP Server）
+            new_properties = {"business": biz_enum}
+            new_properties.update(properties)
+            properties = new_properties
+
+        if "business" not in required:
+            required = ["business"] + required
+
+        # 更新 cluster enum（聚合所有地域的集群）
+        if aggregated_clusters and "cluster" in properties:
+            properties["cluster"]["enum"] = aggregated_clusters
+
+        schema["properties"] = properties
+        schema["required"] = required
 
         merged.append({
             "name": name,
@@ -193,13 +264,39 @@ class QueryAgent:
         # 多业务注册表
         self.registry = BusinessRegistry()
 
-        # 从配置加载初始业务列表并初始化存储
+        # 保存顶层 mcp_servers 列表（用于动态发现）
+        self._mcp_servers: list = self.config.mcp_servers
+
+        # 向后兼容：从 config.businesses 预注册（旧格式）
+        mcp_server_map = {s.name: s for s in self._mcp_servers}
         for name, entry_cfg in self.config.businesses.items():
-            self.registry.register(name, entry_cfg.mcp_server_url, entry_cfg.display_name, api_key=entry_cfg.api_key)
-            self._ensure_business_storage(name)
+            resolved_servers = []
+            for server_ref in entry_cfg.servers:
+                endpoint = mcp_server_map.get(server_ref)
+                if endpoint:
+                    resolved_servers.append(endpoint)
+
+            if not resolved_servers and entry_cfg.mcp_server_url:
+                from src.config import MCPServerEndpoint
+                resolved_servers = [MCPServerEndpoint(
+                    name="default",
+                    url=entry_cfg.mcp_server_url,
+                    api_key=entry_cfg.api_key,
+                )]
+
+            if resolved_servers:
+                self.registry.register(
+                    name,
+                    display_name=entry_cfg.display_name,
+                    servers=resolved_servers,
+                )
+                self._ensure_business_storage(name)
 
         # 加载动态添加的业务（重启后恢复 /add 添加的业务）
         self._load_dynamic_businesses()
+
+        # 加载动态添加的 MCP Server（重启后恢复 /add 添加的 server）
+        self._load_dynamic_servers()
 
         # 数据迁移：将旧的单目录存储拆分到每业务目录
         self._migrate_legacy_storage()
@@ -285,16 +382,121 @@ class QueryAgent:
         """获取指定业务的错误记忆管理器。"""
         return self._get_knowledge_store(business).error_memory
 
+    async def add_mcp_server(self, name: str, url: str, api_key: str = "") -> None:
+        """添加 MCP Server 并从它发现业务。
+
+        Args:
+            name: Server 名称标识。
+            url: MCP Server SSE URL。
+            api_key: 鉴权密钥。
+        """
+        from src.config import MCPServerEndpoint
+        server = MCPServerEndpoint(name=name, url=url, api_key=api_key)
+        self._mcp_servers.append(server)
+        try:
+            discovered = await self.registry.discover_from_servers([server])
+            for biz_name in discovered:
+                self._ensure_business_storage(biz_name)
+            if discovered:
+                self._mark_prompt_dirty()
+        except Exception:
+            logger.warning("从新 MCP Server 发现业务失败", exc_info=True)
+        self._save_dynamic_servers()
+
+    async def remove_mcp_server(self, name: str) -> None:
+        """移除 MCP Server，重新从剩余 server 发现业务。
+
+        Args:
+            name: Server 名称标识。
+        """
+        # 从 _mcp_servers 中移除
+        self._mcp_servers = [s for s in self._mcp_servers if s.name != name]
+
+        # 关闭该 server 的缓存 session
+        removed_server = None
+        for s in self.config.mcp_servers:
+            if s.name == name:
+                removed_server = s
+                break
+        # 也检查动态添加的 servers
+        for s in self._mcp_servers_original if hasattr(self, '_mcp_servers_original') else []:
+            if s.name == name:
+                removed_server = s
+                break
+
+        # 清空所有业务，重新从剩余 server 发现
+        await self.registry.close_all()
+        if self._mcp_servers:
+            try:
+                discovered = await self.registry.discover_from_servers(self._mcp_servers)
+                for biz_name in discovered:
+                    self._ensure_business_storage(biz_name)
+                # 获取集群路由和知识
+                for entry in self.registry.list_businesses():
+                    if not entry.cluster_routing:
+                        await self.registry.fetch_cluster_routing(entry.name)
+                    if entry.knowledge is None:
+                        await self.registry.fetch_business_knowledge(entry.name)
+                self._mark_prompt_dirty()
+            except Exception:
+                logger.warning("重新发现业务失败", exc_info=True)
+        self._save_dynamic_servers()
+
+    def _save_dynamic_servers(self) -> None:
+        """保存动态添加的 MCP Server（非配置文件中的）。"""
+        configured_names = {s.name for s in self.config.mcp_servers}
+        dynamic = []
+        for s in self._mcp_servers:
+            if s.name not in configured_names:
+                dynamic.append({"name": s.name, "url": s.url, "api_key": s.api_key})
+        path = os.path.join(".query-agent", "dynamic_servers.json")
+        os.makedirs(".query-agent", exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _json.dump(dynamic, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
+    def _load_dynamic_servers(self) -> None:
+        """加载动态添加的 MCP Server。"""
+        path = os.path.join(".query-agent", "dynamic_servers.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            configured_names = {s.name for s in self.config.mcp_servers}
+            from src.config import MCPServerEndpoint
+            for s_data in data:
+                name = s_data.get("name", "")
+                if name and name not in configured_names:
+                    server = MCPServerEndpoint(
+                        name=name,
+                        url=s_data.get("url", ""),
+                        api_key=s_data.get("api_key", ""),
+                    )
+                    self._mcp_servers.append(server)
+        except (_json.JSONDecodeError, TypeError, KeyError) as exc:
+            logger.warning("动态 Server 文件解析失败，跳过: %s", exc)
+
     def _save_dynamic_businesses(self) -> None:
         """将动态添加的业务保存到文件，重启后可恢复。"""
         configured = set(self.config.businesses.keys())
         dynamic = {}
         for entry in self.registry.list_businesses():
             if entry.name not in configured:
+                # 保存 servers 列表（新格式）
+                servers_data = [
+                    {"url": s.url, "api_key": s.api_key or ""}
+                    for s in entry.servers
+                ]
+                # 向后兼容：如果只有一个 server，也保存 mcp_server_url/api_key
+                compat_url = entry.servers[0].url if entry.servers else ""
+                compat_key = entry.servers[0].api_key or "" if entry.servers else ""
                 dynamic[entry.name] = {
-                    "mcp_server_url": entry.mcp_server_url,
+                    "mcp_server_url": compat_url,
                     "display_name": entry.display_name,
-                    "api_key": entry.api_key or "",
+                    "api_key": compat_key,
+                    "servers": servers_data,
                 }
         path = os.path.join(".query-agent", "dynamic_businesses.json")
         os.makedirs(".query-agent", exist_ok=True)
@@ -314,12 +516,29 @@ class QueryAgent:
             configured = set(self.config.businesses.keys())
             for name, info in data.items():
                 if name not in configured and not self.registry.has_business(name):
-                    self.registry.register(
-                        name,
-                        info.get("mcp_server_url", ""),
-                        info.get("display_name", name),
-                        api_key=info.get("api_key", ""),
-                    )
+                    # 支持新格式 servers 列表和旧格式 mcp_server_url
+                    servers_data = info.get("servers", [])
+                    if servers_data:
+                        from src.config import MCPServerEndpoint
+                        servers = [
+                            MCPServerEndpoint(
+                                url=s.get("url", ""),
+                                api_key=s.get("api_key", ""),
+                            )
+                            for s in servers_data
+                        ]
+                        self.registry.register(
+                            name,
+                            display_name=info.get("display_name", name),
+                            servers=servers,
+                        )
+                    else:
+                        self.registry.register(
+                            name,
+                            mcp_server_url=info.get("mcp_server_url", ""),
+                            display_name=info.get("display_name", name),
+                            api_key=info.get("api_key", ""),
+                        )
                     self._ensure_business_storage(name)
         except (_json.JSONDecodeError, TypeError, KeyError) as exc:
             logger.warning("动态业务文件解析失败，跳过: %s", exc)
@@ -477,11 +696,27 @@ class QueryAgent:
         """列出当前已注册业务。"""
         return self.registry.list_businesses()
 
+    @property
+    def mcp_servers(self):
+        """返回当前 MCP Server 列表（包含动态添加的）。"""
+        return self._mcp_servers
+
     def add_business(
-        self, name: str, mcp_server_url: str, display_name: str = "", api_key: str = ""
+        self, name: str, mcp_server_url: str = "", display_name: str = "",
+        api_key: str = "", servers: list | None = None,
     ) -> None:
-        """注册新业务、初始化存储并持久化。"""
-        self.registry.register(name, mcp_server_url, display_name, api_key=api_key)
+        """注册新业务、初始化存储并持久化。
+
+        Args:
+            name: 业务标识。
+            mcp_server_url: MCP Server SSE URL（单个 server，向后兼容）。
+            display_name: 显示名称。
+            api_key: MCP Server 鉴权密钥。
+            servers: 多 MCP Server 端点列表（新格式）。
+        """
+        self.registry.register(
+            name, mcp_server_url, display_name, api_key=api_key, servers=servers,
+        )
         self._ensure_business_storage(name)
         self._save_dynamic_businesses()
         self._mark_prompt_dirty()
@@ -711,7 +946,21 @@ class QueryAgent:
         return plan
 
     async def _ensure_knowledge_loaded(self) -> None:
-        """确保所有已注册业务的领域知识已加载（用于构建 system prompt）。"""
+        """确保所有已注册业务的领域知识和集群路由已加载。
+
+        如果没有已注册的业务且有 mcp_servers 配置，先动态发现业务。
+        """
+        # 动态发现：如果没有业务但有 mcp_servers，从 MCP Server 发现
+        if not self.registry.list_businesses() and self._mcp_servers:
+            try:
+                discovered = await self.registry.discover_from_servers(self._mcp_servers)
+                for biz_name in discovered:
+                    self._ensure_business_storage(biz_name)
+                if discovered:
+                    self._mark_prompt_dirty()
+            except Exception:
+                logger.warning("从 MCP Server 发现业务失败", exc_info=True)
+
         for entry in self.registry.list_businesses():
             if entry.knowledge is None:
                 try:
@@ -719,9 +968,15 @@ class QueryAgent:
                     self._mark_prompt_dirty()
                 except Exception:
                     logger.warning("获取业务 '%s' 知识失败，跳过", entry.name, exc_info=True)
+            # 获取集群路由表（聚合多地域 MCP Server 的集群）
+            if not entry.cluster_routing:
+                try:
+                    await self.registry.fetch_cluster_routing(entry.name)
+                except Exception:
+                    logger.warning("获取业务 '%s' 集群路由失败，跳过", entry.name, exc_info=True)
 
     async def _build_merged_tools(self) -> list[dict]:
-        """构建合并了 business 参数的工具列表。"""
+        """构建合并了 business 参数的工具列表（所有业务模式）。"""
         businesses = self.registry.list_businesses()
 
         if not businesses:
@@ -737,20 +992,27 @@ class QueryAgent:
 
         # 多业务 SSE 模式：收集每个业务的工具定义，合并注入 business 参数
         tools_per_business: dict[str, list[dict]] = {}
+        all_clusters: list[str] = []
         for entry in businesses:
             try:
                 tools = await self.registry.fetch_tools_schema(entry.name)
                 tools_per_business[entry.name] = tools
+                all_clusters.extend(entry.cluster_routing.keys())
             except Exception:
                 logger.warning("获取业务 '%s' 工具列表失败，跳过", entry.name, exc_info=True)
 
         if not tools_per_business:
             return []
 
-        return _merge_tools_with_business_param(tools_per_business)
+        return _merge_tools_with_business_param(tools_per_business, all_clusters)
 
     async def _build_business_tools(self, business_name: str) -> list[dict]:
-        """为单个业务构建工具视图，仅暴露该业务。"""
+        """为单个业务构建工具视图，仅暴露该业务。
+
+        MCP Server 工具自带 business 参数，但 LLM 不需要填写它（agent 自动填充）。
+        因此从工具定义中移除 business，让 route_tool_call 自动注入。
+        同时更新 cluster 参数的 enum 为聚合后的全地域集群列表。
+        """
         if self._is_stdio_mode:
             async with stdio_client(self.mcp_server_params) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
@@ -759,7 +1021,9 @@ class QueryAgent:
                     return _convert_mcp_tools_to_anthropic(tools_result.tools)
 
         tools = await self.registry.fetch_tools_schema(business_name)
-        return _merge_tools_with_business_param({business_name: tools})
+        entry = self.registry.get_entry(business_name)
+        aggregated_clusters = list(entry.cluster_routing.keys())
+        return _prepare_business_tools(tools, aggregated_clusters)
 
     async def run_query(self, user_input: str) -> str:
         """发送用户查询并返回 Agent 的最终文本响应。
@@ -959,7 +1223,7 @@ class QueryAgent:
             for tc in (response.tool_calls or []):
                 metrics.tool_calls += 1
 
-                # 提前保存 business（多业务模式下 _route_tool_call 会 pop 掉）
+                # 从 LLM 工具调用参数中提取 business（多业务"all"模式下 LLM 会填写）
                 tc_business = tc.arguments.get("business", "") if isinstance(tc.arguments, dict) else ""
                 tool_args = dict(tc.arguments) if isinstance(tc.arguments, dict) else {}
                 current_business = tc_business or self.get_last_business() or "default"
@@ -1031,28 +1295,38 @@ class QueryAgent:
         metrics: QueryMetrics,
         system_prompt: str,
     ) -> str:
-        """执行消息循环（多业务模式），通过 BusinessRegistry 路由工具调用。"""
+        """执行消息循环（多业务模式），通过 BusinessRegistry 路由工具调用。
+
+        当已选定单个业务时，agent 自动填充 business 参数（LLM 工具定义不含 business）。
+        当展示所有业务时，LLM 自行选择 business 参数。
+        """
+        # 确定当前业务上下文（用于自动填充 business 参数）
+        current_business = metrics.selected_business if metrics.selected_business != "all" else ""
+
         async def execute_tool(name: str, args: dict, _business: str) -> tuple[str, str]:
-            result_text = await self._route_tool_call(name, args)
-            return result_text, _business
+            result_text = await self._route_tool_call(name, args, current_business)
+            resolved = _business or current_business or args.get("business", "")
+            return result_text, resolved
 
         return await self._conversation_loop_core(
             tools, user_input, metrics, system_prompt=system_prompt, execute_tool=execute_tool,
         )
 
-    async def _route_tool_call(self, tool_name: str, arguments: dict) -> str:
+    async def _route_tool_call(self, tool_name: str, arguments: dict, current_business: str = "") -> str:
         """路由工具调用到对应的业务 MCP Server。
 
-        从 arguments 中提取 business 参数，路由到对应业务的 MCP session。
+        如果 arguments 中没有 business 参数（单业务模式），使用 current_business 自动填充。
+        路由逻辑根据 cluster 参数选择地域 MCP Server。
 
         Args:
             tool_name: 工具名称。
-            arguments: 工具参数（包含 business 字段）。
+            arguments: 工具参数（可能不含 business）。
+            current_business: 当前选定的业务名（用于自动填充）。
 
         Returns:
             工具结果的 JSON 字符串。
         """
-        return await self._tool_execution.route_tool_call(tool_name, arguments)
+        return await self._tool_execution.route_tool_call(tool_name, arguments, current_business)
 
     @staticmethod
     def _generate_lesson(error_type: str, error_message: str, bad_sql: str) -> str:

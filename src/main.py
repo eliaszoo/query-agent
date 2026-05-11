@@ -18,21 +18,21 @@ EXIT_COMMANDS = {"exit", "quit", "q"}
 
 # Slash 命令定义：命令名 → (补全文本, 简短说明, 参数提示)
 SLASH_COMMANDS = {
-    "/add":         ("/add ",      "Add business",          "<name> <sse_url> [display] [key]"),
+    "/add":         ("/add ",      "Add MCP Server",       "<server_name> <sse_url> [api_key]"),
     "/business":    ("/business ", "Show or lock business", "current|set <name>|clear"),
     "/clear":       ("/clear ",    "Clear error memory",    "[business]"),
     "/exit":        ("/exit",      "Exit",                  ""),
     "/field":       ("/field ",    "Add field knowledge",   "<table>.<col> <desc>"),
     "/field_rm":    ("/field_rm ", "Remove field knowledge","<table>.<col>"),
     "/fields":      ("/fields",    "List field knowledge",  ""),
-    "/list":        ("/list",      "List businesses",       ""),
+    "/list":        ("/list",      "List servers & businesses", ""),
     "/memory":      ("/memory",    "Show error memory",     ""),
     "/new":         ("/new",       "New conversation",      ""),
     "/pin":         ("/pin ",      "Pin context message",   "<message>"),
     "/plan":        ("/plan ",     "Preview query plan",    "<query>"),
     "/quit":        ("/quit",      "Exit",                  ""),
     "/remember":    ("/remember ", "Save default rule",     "<rule>"),
-    "/remove":      ("/remove ",   "Remove business",       "<name>"),
+    "/remove":      ("/remove ",   "Remove MCP Server",     "<server_name>"),
     "/rules":       ("/rules",     "List default rules",    ""),
     "/rules_clear": ("/rules_clear ", "Clear default rules","[business]"),
 }
@@ -96,7 +96,7 @@ class SlashCommandCompleter(Completer):
             return [n for n in names if n.startswith(text)]
 
         if cmd in ("/remove",) and arg_index == 1:
-            names = [e.name for e in agent.registry.list_businesses()]
+            names = [s.name for s in agent.mcp_servers]
             return [n for n in names if n.startswith(text)]
 
         if cmd in ("/clear", "/rules_clear") and arg_index == 1:
@@ -277,9 +277,9 @@ def _likely_feedback(text: str) -> bool:
 
 _SLASH_HELP = f"""\
 {_DIM}Slash commands (Tab to autocomplete):{_RESET}
-  {_CYAN}/add{_RESET} <name> <sse_url> [display] [key]   Add business
-  {_CYAN}/remove{_RESET} <name>                    Remove business
-  {_CYAN}/list{_RESET}                             List businesses
+  {_CYAN}/add{_RESET} <name> <sse_url> [key]        Add MCP Server
+  {_CYAN}/remove{_RESET} <name>                    Remove MCP Server
+  {_CYAN}/list{_RESET}                             List servers & businesses
   {_CYAN}/memory{_RESET}                           Show error memory (grouped by business)
   {_CYAN}/clear{_RESET} [business]                  Clear memory (all if no business specified)
   {_CYAN}/new{_RESET}                              Start new conversation
@@ -315,44 +315,75 @@ Registered businesses:
 
 
 async def _handle_add(agent: QueryAgent, args: list[str]) -> None:
-    """处理 /add 命令。"""
+    """处理 /add 命令：添加 MCP Server 并自动发现业务。"""
     if len(args) < 2:
-        print(f"  {_DIM}Usage: /add <name> <sse_url> [display_name] [api_key]{_RESET}")
+        print(f"  {_DIM}Usage: /add <server_name> <sse_url> [api_key]{_RESET}")
         return
 
     name = args[0]
     url = args[1]
-    display_name = args[2] if len(args) > 2 else name
-    api_key = args[3] if len(args) > 3 else ""
+    api_key = args[2] if len(args) > 2 else ""
 
-    agent.add_business(name, url, display_name, api_key=api_key)
-    print(f"  {_GREEN}Added{_RESET} business: {name} ({display_name}) -> {url}")
+    await agent.add_mcp_server(name, url, api_key=api_key)
+
+    # 显示新发现的业务
+    businesses = agent.list_businesses()
+    print(f"  {_GREEN}Added{_RESET} MCP Server: {name} ({url})")
+    if businesses:
+        print(f"  {_DIM}Discovered businesses:{_RESET}")
+        for b in businesses:
+            clusters = ", ".join(b.cluster_routing.keys()) if b.cluster_routing else "pending"
+            print(f"    - {b.name} ({b.display_name}) clusters: {clusters}")
 
 
 async def _handle_remove(agent: QueryAgent, args: list[str]) -> None:
-    """处理 /remove 命令。"""
+    """处理 /remove 命令：移除 MCP Server。"""
     if len(args) < 1:
-        print(f"  {_DIM}Usage: /remove <name>{_RESET}")
+        print(f"  {_DIM}Usage: /remove <server_name>{_RESET}")
         return
 
     name = args[0]
-    try:
-        await agent.remove_business(name)
-        print(f"  {_GREEN}Removed{_RESET} business: {name}")
-    except KeyError as e:
-        print(f"  {_RED}Error:{_RESET} {e}")
-
-
-def _handle_list(agent: QueryAgent) -> None:
-    """处理 /list 命令。"""
-    businesses = agent.list_businesses()
-    if not businesses:
-        print(f"  {_DIM}No businesses registered. Use /add to add one.{_RESET}")
+    # 检查 server 是否存在
+    server_names = [s.name for s in agent.mcp_servers]
+    if name not in server_names:
+        print(f"  {_RED}Error:{_RESET} MCP Server '{name}' not found. Available: {', '.join(server_names) or 'none'}")
         return
 
-    for b in businesses:
-        status = f"{_GREEN}loaded{_RESET}" if b.knowledge else f"{_YELLOW}pending{_RESET}"
-        print(f"  - {b.name} ({b.display_name}) -> {b.mcp_server_url} [{status}]")
+    await agent.remove_mcp_server(name)
+    print(f"  {_GREEN}Removed{_RESET} MCP Server: {name}")
+
+
+async def _handle_list(agent: QueryAgent) -> None:
+    """处理 /list 命令：显示 MCP Server 和发现的业务。"""
+    # 确保业务已发现
+    if not agent.list_businesses() and agent.mcp_servers:
+        try:
+            await agent._ensure_knowledge_loaded()
+        except Exception:
+            pass
+
+    # 显示 MCP Server
+    servers = agent.mcp_servers
+    if servers:
+        print(f"\n  {_BOLD}MCP Servers:{_RESET}")
+        for s in servers:
+            print(f"    - {s.name} ({s.url})")
+
+    # 显示业务
+    businesses = agent.list_businesses()
+    if businesses:
+        print(f"\n  {_BOLD}Businesses:{_RESET}")
+        for b in businesses:
+            status = f"{_GREEN}loaded{_RESET}" if b.knowledge else f"{_YELLOW}pending{_RESET}"
+            clusters = ", ".join(b.cluster_routing.keys()) if b.cluster_routing else "pending"
+            server_urls = ", ".join(s.url for s in b.servers) if b.servers else "local"
+            print(f"    - {b.name} ({b.display_name}) [{status}]")
+            print(f"      clusters: {clusters}")
+            print(f"      servers: {server_urls}")
+    elif not servers:
+        print(f"  {_DIM}No MCP Servers configured. Use /add to add one.{_RESET}")
+    else:
+        print(f"  {_DIM}No businesses discovered from MCP Servers.{_RESET}")
 
 
 def _handle_memory(agent: QueryAgent) -> None:
@@ -478,12 +509,12 @@ async def main(config_path: str = "./config.yaml") -> None:
     businesses = []
     if config.businesses:
         from src.business_registry import BusinessEntry
+        mcp_server_map = {s.name: s for s in config.mcp_servers}
         businesses = [
             BusinessEntry(
                 name=name,
                 display_name=cfg.display_name,
-                mcp_server_url=cfg.mcp_server_url,
-                api_key=cfg.api_key,
+                servers=[mcp_server_map[ref] for ref in cfg.servers if ref in mcp_server_map],
             )
             for name, cfg in config.businesses.items()
         ]
@@ -635,7 +666,7 @@ async def main(config_path: str = "./config.yaml") -> None:
             continue
 
         if cmd == "/list":
-            _handle_list(agent)
+            await _handle_list(agent)
             continue
 
         # 未知 slash 命令拦截

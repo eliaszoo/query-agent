@@ -1,30 +1,54 @@
 # ============================================================
 # MCP Server 配置（部署在数据库所在机器上）
 # 包含：数据库连接、SQL 安全策略、业务领域知识
+#
+# 支持两种集群配置格式：
+# 1. 扁平格式（单业务）：clusters: { cluster_name: {host, port, ...} }
+# 2. 嵌套格式（多业务）：clusters: { business_name: { cluster_name: {host, port, ...} } }
+#
+# 启动命令（SSE 模式）:
+#   MCP_HOST=0.0.0.0 MCP_PORT=8765 python -m src.query_mcp_server --transport sse --config config-server.yaml
 # ============================================================
 
-# 数据库集群（可配置多个环境）
+# 数据库集群 — 嵌套格式（一个 MCP Server 服务多个业务）
+# 每个业务下可配置多个地域集群
 clusters:
-  test:
-    description: "测试环境"
-    host: "${DB_TEST_HOST}"        # 环境变量替换，启动前需 export DB_TEST_HOST=xxx
-    port: 3306
-    database: "${DB_TEST_DB}"
-    user: "${DB_TEST_USER}"
-    password: "${DB_TEST_PASSWORD}"
-  production:
-    description: "生产环境"
-    host: "${DB_PROD_HOST}"
-    port: 3306
-    database: "${DB_PROD_DB}"
-    user: "${DB_PROD_USER}"
-    password: "${DB_PROD_PASSWORD}"
+  digitalhuman:
+    huangpu:
+      description: "数字人-上海黄埔"
+      host: "${DB_DH_HUANGPU_HOST}"
+      port: 3306
+      database: "${DB_DH_HUANGPU_DB}"
+      user: "${DB_DH_HUANGPU_USER}"
+      password: "${DB_DH_HUANGPU_PASSWORD}"
+    tiantan:
+      description: "数字人-北京天坛"
+      host: "${DB_DH_TIANTAN_HOST}"
+      port: 3306
+      database: "${DB_DH_TIANTAN_DB}"
+      user: "${DB_DH_TIANTAN_USER}"
+      password: "${DB_DH_TIANTAN_PASSWORD}"
+  copyright_music:
+    huangpu:
+      description: "版权音乐-上海黄埔"
+      host: "${DB_CM_HUANGPU_HOST}"
+      port: 3306
+      database: "${DB_CM_HUANGPU_DB}"
+      user: "${DB_CM_HUANGPU_USER}"
+      password: "${DB_CM_HUANGPU_PASSWORD}"
+    tiantan:
+      description: "版权音乐-北京天坛"
+      host: "${DB_CM_TIANTAN_HOST}"
+      port: 3306
+      database: "${DB_CM_TIANTAN_DB}"
+      user: "${DB_CM_TIANTAN_USER}"
+      password: "${DB_CM_TIANTAN_PASSWORD}"
 
 # SQL 安全策略
 sql_security:
   max_rows: 100              # 单次查询最大返回行数
   query_timeout: 30          # 查询超时（秒）
-  allowed_tables:            # 白名单表（只有这些表可以被查询）
+  allowed_tables:            # 全局白名单表（未配置 business_allowed_tables 的业务使用此列表）
     - "tb_scene"
     - "tb_scene_app"
     - "tb_scene_customer"
@@ -49,36 +73,53 @@ sql_security:
     - "tb_content_scene"
     - "tb_paas_live"
     - "tb_tts_task"
+  # 按业务配置不同的白名单
+  business_allowed_tables:
+    copyright_music:
+      - "tb_song"
+      - "tb_artist"
+      - "tb_album"
+      - "tb_license"
 
 # 业务领域知识（通过 get_business_knowledge 工具提供给 Agent）
-business_knowledge:
-  description: "数字人平台"
-  term_mappings:
-    "模型": "tb_model 表"
-    "形象/数字人": "tb_scene 表（包含训练状态、分辨率等详细信息）"
-    "训练/训练任务": "tb_train 表"
-    "音色": "tb_voice 表"
-    "直播间": "tb_live 表"
-    "背景": "tb_background 表"
-    "应用/App": "tb_app 表"
-    "渠道/租户": "tb_channel 表"
-  table_relationships:
-    - "tb_scene.model_id → tb_model.id（形象属于某个数字人模型）"
-    - "tb_scene.train_id → tb_train.id（形象关联训练任务）"
-    - "tb_scene_app.scene_id → tb_scene.id（数字人与app的关联）"
-    - "tb_scene_voice.scene_id → tb_scene.id（数字人与音色的关联）"
-    - "tb_scene_voice.voice_id → tb_voice.id"
-    - "tb_live.scene_id → tb_scene.id（直播间使用的形象）"
-    - "tb_scene.docker_version_id → tb_docker_version.id"
-  status_codes:
-    - "tb_scene.status: 1=训练中, 2=训练成功, 3=训练失败"
-    - "tb_scene.type: 1=视频型, 2=图片型"
-    - "tb_scene.forbidden_status: 1=正常, 2=禁用"
-    - "tb_scene.visibility: 1=公用, 2=定制"
-    - "tb_train.status: 0=未开始, 1=训练中, 2=成功, 3=失败"
-    - "tb_live.status: 1=编辑中, 2=审核中, 3=审核失败, 4=生成中, 5=生成失败, 6=待开播"
-    - "tb_model.sex: 1=男, 2=女"
-  custom_rules: []
+business_knowledges:
+  digitalhuman:
+    description: "数字人平台"
+    term_mappings:
+      "模型": "tb_model 表"
+      "形象/数字人": "tb_scene 表（包含训练状态、分辨率等详细信息）"
+      "训练/训练任务": "tb_train 表"
+      "音色": "tb_voice 表"
+      "直播间": "tb_live 表"
+      "背景": "tb_background 表"
+      "应用/App": "tb_app 表"
+      "渠道/租户": "tb_channel 表"
+    table_relationships:
+      - "tb_scene.model_id → tb_model.id（形象属于某个数字人模型）"
+      - "tb_scene.train_id → tb_train.id（形象关联训练任务）"
+      - "tb_scene_app.scene_id → tb_scene.id（数字人与app的关联）"
+      - "tb_scene_voice.scene_id → tb_scene.id（数字人与音色的关联）"
+      - "tb_scene_voice.voice_id → tb_voice.id"
+      - "tb_live.scene_id → tb_scene.id（直播间使用的形象）"
+      - "tb_scene.docker_version_id → tb_docker_version.id"
+    status_codes:
+      - "tb_scene.status: 1=训练中, 2=训练成功, 3=训练失败"
+      - "tb_scene.type: 1=视频型, 2=图片型"
+      - "tb_scene.forbidden_status: 1=正常, 2=禁用"
+      - "tb_scene.visibility: 1=公用, 2=定制"
+      - "tb_train.status: 0=未开始, 1=训练中, 2=成功, 3=失败"
+      - "tb_live.status: 1=编辑中, 2=审核中, 3=审核失败, 4=生成中, 5=生成失败, 6=待开播"
+      - "tb_model.sex: 1=男, 2=女"
+    custom_rules: []
+  copyright_music:
+    description: "版权音乐管理平台"
+    term_mappings:
+      "歌曲": "tb_song 表"
+      "歌手": "tb_artist 表"
+      "专辑": "tb_album 表"
+      "授权": "tb_license 表"
+    custom_rules:
+      - "查询歌曲时默认过滤已下架数据"
 
 # 鉴权配置
 auth:

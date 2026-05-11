@@ -132,9 +132,15 @@ async def _ensure_initialized() -> tuple[AppConfig, ConnectionPoolManager, SQLVa
 
         config_path = os.environ.get("CONFIG_PATH", "./config.yaml")
         _config = load_config(config_path)
-        _pool_manager = ConnectionPoolManager(_config.clusters)
+        _pool_manager = ConnectionPoolManager(
+            cluster_configs=_config.clusters,
+            business_clusters=_config.business_clusters,
+        )
         await _pool_manager.initialize()
-        _validator = SQLValidator(allowed_tables=_config.sql_security.allowed_tables)
+        _validator = SQLValidator(
+            allowed_tables=_config.sql_security.allowed_tables,
+            business_allowed_tables=_config.sql_security.business_allowed_tables,
+        )
 
     return _config, _pool_manager, _validator
 
@@ -150,6 +156,7 @@ async def execute_readonly_sql(
     sql: str,
     max_rows: int = 100,
     risk_note: str = "",
+    business: str = "",
 ) -> dict:
     """在指定集群上执行只读 SQL 查询。
 
@@ -158,6 +165,7 @@ async def execute_readonly_sql(
         sql: SQL 查询语句。
         max_rows: 最大返回行数。
         risk_note: LLM 声明的性能风险分析（不影响执行，仅用于 Agent 侧风险展示）。
+        business: 业务名称（多业务模式下用于选择 allowed_tables 和路由连接池）。
     """
     try:
         config, pool_manager, validator = await _ensure_initialized()
@@ -165,21 +173,29 @@ async def execute_readonly_sql(
         return _error_response("CONNECTION_ERROR", f"初始化失败: {exc}")
 
     # 1. 验证集群是否存在
-    if not pool_manager.cluster_configured(cluster):
+    if business and pool_manager.business_cluster_configured(business, cluster):
+        # 多业务模式：精确路由
+        if not pool_manager.has_business_cluster(business, cluster):
+            return _error_response(
+                "CONNECTION_ERROR",
+                f"业务 '{business}' 集群 '{cluster}' 连接池未就绪，请检查集群状态。",
+            )
+    elif pool_manager.cluster_configured(cluster):
+        # 扁平模式（向后兼容）
+        if not pool_manager.has_cluster(cluster):
+            return _error_response(
+                "CONNECTION_ERROR",
+                f"集群 '{cluster}' 连接池未就绪，请检查集群状态。",
+            )
+    else:
         available = list(config.clusters.keys())
         return _error_response(
             "INVALID_CLUSTER",
             f"集群 '{cluster}' 不存在。可用集群: {', '.join(available)}",
         )
 
-    if not pool_manager.has_cluster(cluster):
-        return _error_response(
-            "CONNECTION_ERROR",
-            f"集群 '{cluster}' 连接池未就绪，请检查集群状态。",
-        )
-
-    # 2. SQL 安全验证
-    result = validator.validate(sql)
+    # 2. SQL 安全验证（按业务选择 allowed_tables）
+    result = validator.validate(sql, business=business)
     if not result.is_valid:
         return _error_response(
             result.error_type or "UNSAFE_SQL",
@@ -191,7 +207,11 @@ async def execute_readonly_sql(
 
     # 4. 执行查询
     try:
-        async with pool_manager.get_connection(cluster) as conn:
+        if business and pool_manager.has_business_cluster(business, cluster):
+            ctx = pool_manager.get_business_connection(business, cluster)
+        else:
+            ctx = pool_manager.get_connection(cluster)
+        async with ctx as conn:
             async with conn.cursor() as cur:
                 # 设置查询超时（MySQL 5.7.8+，仅对 SELECT 生效）
                 timeout_ms = config.sql_security.query_timeout * 1000
@@ -223,21 +243,53 @@ async def execute_readonly_sql(
 
 
 @mcp.tool()
-async def get_cluster_list() -> dict:
-    """获取所有已配置的数据库集群列表。"""
+async def get_cluster_list(business: str = "") -> dict:
+    """获取已配置的数据库集群列表。
+
+    Args:
+        business: 业务名称（可选）。指定则只返回该业务的集群，不指定则返回所有集群。
+    """
     try:
         config, pool_manager, _ = await _ensure_initialized()
     except Exception as exc:
         return _error_response("CONNECTION_ERROR", f"初始化失败: {exc}")
 
-    clusters = []
-    for name, cluster_cfg in config.clusters.items():
-        clusters.append({
-            "name": name,
-            "description": cluster_cfg.description,
-            "database": cluster_cfg.database,
-            "status": pool_manager.get_pool_status(name),
-        })
+    if business:
+        # 多业务模式：只返回指定业务的集群
+        biz_cluster_names = pool_manager.get_business_cluster_list(business)
+        if not biz_cluster_names:
+            available = pool_manager.get_business_list()
+            return _error_response(
+                "INVALID_BUSINESS",
+                f"业务 '{business}' 不存在或无集群。可用业务: {', '.join(available)}",
+            )
+        clusters = []
+        for name in biz_cluster_names:
+            cluster_cfg = config.business_clusters.get(business, {}).get(name)
+            if cluster_cfg:
+                clusters.append({
+                    "name": name,
+                    "description": cluster_cfg.description,
+                    "database": cluster_cfg.database,
+                    "status": pool_manager.get_pool_status(name),
+                })
+            else:
+                clusters.append({
+                    "name": name,
+                    "description": "",
+                    "database": "",
+                    "status": pool_manager.get_pool_status(name),
+                })
+    else:
+        # 扁平模式：返回所有集群
+        clusters = []
+        for name, cluster_cfg in config.clusters.items():
+            clusters.append({
+                "name": name,
+                "description": cluster_cfg.description,
+                "database": cluster_cfg.database,
+                "status": pool_manager.get_pool_status(name),
+            })
 
     return {"clusters": clusters}
 
@@ -246,8 +298,15 @@ async def get_cluster_list() -> dict:
 async def get_table_schema(
     cluster: str,
     table_name: str | None = None,
+    business: str = "",
 ) -> dict:
-    """获取表结构。不指定 table_name 则返回所有允许查询的表列表。"""
+    """获取表结构。不指定 table_name 则返回所有允许查询的表列表。
+
+    Args:
+        cluster: 集群名称。
+        table_name: 表名（可选，不指定则返回白名单表列表）。
+        business: 业务名称（可选，用于选择 allowed_tables）。
+    """
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:
@@ -269,14 +328,15 @@ async def get_table_schema(
 
     # 无 table_name → 返回白名单表列表
     if table_name is None:
-        return {"tables": list(validator._allowed_tables)}
+        allowed_set = validator._get_allowed_set(business)
+        return {"tables": list(allowed_set)}
 
     # 校验表名合法性（纵深防御，防止 SQL 注入）
     if not _validate_table_name(table_name):
         return _error_response("INVALID_INPUT", f"非法表名: {table_name}")
 
     # 验证 table_name 在白名单中
-    allowed_set = set(validator._allowed_tables)
+    allowed_set = validator._get_allowed_set(business)
     if allowed_set and table_name not in allowed_set:
         return _error_response(
             "FORBIDDEN_TABLE",
@@ -313,8 +373,15 @@ async def get_table_schema(
 async def get_table_indexes(
     cluster: str,
     table_name: str | None = None,
+    business: str = "",
 ) -> dict:
-    """获取表的索引信息。不指定 table_name 则返回所有白名单表的索引。"""
+    """获取表的索引信息。不指定 table_name 则返回所有白名单表的索引。
+
+    Args:
+        cluster: 集群名称。
+        table_name: 表名（可选）。
+        business: 业务名称（可选，用于选择 allowed_tables）。
+    """
     try:
         config, pool_manager, validator = await _ensure_initialized()
     except Exception as exc:
@@ -340,7 +407,7 @@ async def get_table_indexes(
             return _error_response("INVALID_INPUT", f"非法表名: {table_name}")
         tables_to_query = [table_name]
     else:
-        tables_to_query = list(validator._allowed_tables)
+        tables_to_query = list(validator._get_allowed_set(business))
 
     if not tables_to_query:
         return {"indexes": []}
@@ -393,14 +460,23 @@ async def get_table_indexes(
 
 
 @mcp.tool()
-async def get_business_knowledge() -> dict:
-    """获取当前配置的业务领域知识。"""
+async def get_business_knowledge(business: str = "") -> dict:
+    """获取业务领域知识。
+
+    Args:
+        business: 业务名称（可选）。指定则返回该业务的领域知识，不指定则返回默认业务知识。
+    """
     try:
         config, _, _ = await _ensure_initialized()
     except Exception as exc:
         return _error_response("CONNECTION_ERROR", f"初始化失败: {exc}")
 
-    bk = config.business_knowledge
+    # 按业务选择知识
+    if business and business in config.business_knowledges:
+        bk = config.business_knowledges[business]
+    else:
+        bk = config.business_knowledge
+
     return {
         "description": bk.description,
         "term_mappings": bk.term_mappings,
@@ -408,6 +484,36 @@ async def get_business_knowledge() -> dict:
         "status_codes": bk.status_codes,
         "custom_rules": bk.custom_rules,
     }
+
+
+@mcp.tool()
+async def get_business_list() -> dict:
+    """获取当前 MCP Server 支持的所有业务列表。"""
+    try:
+        config, pool_manager, _ = await _ensure_initialized()
+    except Exception as exc:
+        return _error_response("CONNECTION_ERROR", f"初始化失败: {exc}")
+
+    businesses = []
+    # 从 business_clusters 获取
+    for biz_name in pool_manager.get_business_list():
+        biz_clusters = pool_manager.get_business_cluster_list(biz_name)
+        bk = config.business_knowledges.get(biz_name, config.business_knowledge)
+        businesses.append({
+            "name": biz_name,
+            "display_name": bk.description or biz_name,
+            "clusters": biz_clusters,
+        })
+
+    # 如果 business_clusters 为空但有扁平 clusters，提供 default 业务
+    if not businesses and config.clusters:
+        businesses.append({
+            "name": "default",
+            "display_name": config.business_knowledge.description or "默认业务",
+            "clusters": list(config.clusters.keys()),
+        })
+
+    return {"businesses": businesses}
 
 
 # ---------------------------------------------------------------------------
