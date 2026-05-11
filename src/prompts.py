@@ -27,15 +27,18 @@ def build_system_prompt(
     # 单业务模式（向后兼容）
     bk = next(iter(knowledge_map.values()), None) if knowledge_map else None
     clusters = []
+    cluster_descriptions: dict[str, str] = {}
     if businesses:
         clusters = list(businesses[0].cluster_routing.keys())
-    return _build_single_business_prompt(bk, clusters)
+        cluster_descriptions = businesses[0].cluster_descriptions
+    return _build_single_business_prompt(bk, clusters, cluster_descriptions)
 
 
-def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None = None, clusters: list[str] | None = None) -> str:
+def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None = None, clusters: list[str] | None = None, cluster_descriptions: dict[str, str] | None = None) -> str:
     """构建单业务 system prompt。"""
     bk = business_knowledge or BusinessKnowledge()
     description = bk.description or "业务"
+    cluster_descriptions = cluster_descriptions or {}
 
     parts = [
         f"你是一个{description}数据查询助手。你可以帮助运营人员查询{description}的业务数据。",
@@ -48,7 +51,8 @@ def _build_single_business_prompt(business_knowledge: BusinessKnowledge | None =
 
     if clusters:
         parts.append("")
-        parts.append(f"## 可用集群: {', '.join(clusters)}")
+        cluster_labels = [f"{c} ({cluster_descriptions[c]})" if cluster_descriptions.get(c) else c for c in clusters]
+        parts.append(f"## 可用集群: {', '.join(cluster_labels)}")
 
     if bk.term_mappings:
         parts.append("")
@@ -110,7 +114,11 @@ def _build_multi_business_prompt(
         desc = bk.description if bk and bk.description else entry.display_name
         # 展示每个业务的集群列表（包含所有地域）
         clusters = list(entry.cluster_routing.keys()) if entry.cluster_routing else []
-        cluster_info = f"，集群: {', '.join(clusters)}" if clusters else ""
+        if clusters:
+            cluster_labels = [f"{c} ({entry.cluster_descriptions[c]})" if entry.cluster_descriptions.get(c) else c for c in clusters]
+            cluster_info = f"，集群: {', '.join(cluster_labels)}"
+        else:
+            cluster_info = ""
         parts.append(f"- **{entry.name}** ({entry.display_name}): {desc}{cluster_info}")
 
     parts.append("")

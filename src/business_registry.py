@@ -34,6 +34,8 @@ class BusinessEntry:
     # 集群路由表：cluster_name → MCPServerEndpoint
     # 在调用 fetch_cluster_routing() 后填充
     cluster_routing: dict[str, MCPServerEndpoint] = field(default_factory=dict)
+    # 集群描述：cluster_name → description（如 "pre" → "预发布"）
+    cluster_descriptions: dict[str, str] = field(default_factory=dict)
     _connected: bool = field(default=False, repr=False, init=False)
 
 
@@ -136,6 +138,7 @@ class BusinessRegistry:
                 data = json.loads(result_text)
                 for cluster_info in data.get("clusters", []):
                     cluster_name = cluster_info.get("name", "")
+                    cluster_desc = cluster_info.get("description", "")
                     if cluster_name:
                         if cluster_name in routing:
                             logger.warning(
@@ -143,6 +146,8 @@ class BusinessRegistry:
                                 cluster_name,
                             )
                         routing[cluster_name] = server
+                        if cluster_desc:
+                            entry.cluster_descriptions[cluster_name] = cluster_desc
             except Exception:
                 logger.warning(
                     "从 MCP Server %s 获取集群列表失败", server.url, exc_info=True

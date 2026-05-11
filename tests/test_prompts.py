@@ -162,3 +162,68 @@ class TestBuildSystemPromptMultiBusiness:
         prompt = build_system_prompt(businesses=businesses)
         assert "huangpu" in prompt
         assert "集群" in prompt
+
+    def test_single_business_cluster_descriptions(self):
+        """单业务 prompt 中集群显示中文描述。"""
+        server = MCPServerEndpoint(url="http://sh:8765/sse")
+        business = BusinessEntry(
+            name="digitalhuman",
+            display_name="数字人",
+            servers=[server],
+            cluster_routing={
+                "test": server,
+                "pre": server,
+                "huangpu": server,
+            },
+            cluster_descriptions={
+                "test": "测试",
+                "pre": "预发布",
+                "huangpu": "上海黄埔",
+            },
+        )
+        prompt = build_system_prompt(businesses=[business])
+        assert "test (测试)" in prompt
+        assert "pre (预发布)" in prompt
+        assert "huangpu (上海黄埔)" in prompt
+
+    def test_multi_business_cluster_descriptions(self):
+        """多业务 prompt 中集群显示中文描述。"""
+        server = MCPServerEndpoint(url="http://sh:8765/sse")
+        businesses = [
+            BusinessEntry(
+                name="digitalhuman",
+                display_name="数字人",
+                servers=[server],
+                cluster_routing={
+                    "test": server,
+                    "pre": server,
+                },
+                cluster_descriptions={
+                    "test": "测试",
+                    "pre": "预发布",
+                },
+            ),
+        ]
+        prompt = build_system_prompt(businesses=businesses)
+        assert "test (测试)" in prompt
+        assert "pre (预发布)" in prompt
+
+    def test_cluster_without_description_shows_name_only(self):
+        """无描述的集群只显示名称。"""
+        server = MCPServerEndpoint(url="http://sh:8765/sse")
+        business = BusinessEntry(
+            name="digitalhuman",
+            display_name="数字人",
+            servers=[server],
+            cluster_routing={
+                "test": server,
+                "prod": server,
+            },
+            cluster_descriptions={
+                "test": "测试",
+            },
+        )
+        prompt = build_system_prompt(businesses=[business])
+        assert "test (测试)" in prompt
+        assert "prod" in prompt
+        assert "prod (" not in prompt

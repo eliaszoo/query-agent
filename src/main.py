@@ -335,7 +335,8 @@ async def _handle_add(agent: QueryAgent, args: list[str]) -> None:
     if businesses:
         print(f"  {_DIM}Discovered businesses:{_RESET}")
         for b in businesses:
-            clusters = ", ".join(b.cluster_routing.keys()) if b.cluster_routing else "pending"
+            cluster_labels = [f"{c} ({b.cluster_descriptions[c]})" if b.cluster_descriptions.get(c) else c for c in b.cluster_routing.keys()] if b.cluster_routing else ["pending"]
+            clusters = ", ".join(cluster_labels)
             print(f"    - {b.name} ({b.display_name}) clusters: {clusters}")
 
 
@@ -378,7 +379,8 @@ async def _handle_list(agent: QueryAgent) -> None:
         print(f"\n  {_BOLD}Businesses:{_RESET}")
         for b in businesses:
             status = f"{_GREEN}loaded{_RESET}" if b.knowledge else f"{_YELLOW}pending{_RESET}"
-            clusters = ", ".join(b.cluster_routing.keys()) if b.cluster_routing else "pending"
+            cluster_labels = [f"{c} ({b.cluster_descriptions[c]})" if b.cluster_descriptions.get(c) else c for c in b.cluster_routing.keys()] if b.cluster_routing else ["pending"]
+            clusters = ", ".join(cluster_labels)
             server_urls = ", ".join(s.url for s in b.servers) if b.servers else "local"
             print(f"    - {b.name} ({b.display_name}) [{status}]")
             print(f"      clusters: {clusters}")
@@ -524,7 +526,7 @@ async def main(config_path: str = "./config.yaml") -> None:
         level=logging.WARNING,
         format="%(name)s: %(message)s",
     )
-    logging.getLogger("src").setLevel(logging.INFO)
+    logging.getLogger("src").setLevel(logging.WARNING)
 
     config = load_config(config_path)
     businesses = []
