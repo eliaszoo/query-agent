@@ -194,6 +194,35 @@ def _build_text_card(result: str, metrics: QueryMetrics | None) -> dict:
     }
 
 
+def build_command_card(title: str, content: str) -> str:
+    """构建命令结果卡片。
+
+    Args:
+        title: 卡片标题（如 "MCP Servers & Businesses"）。
+        content: Markdown 格式的命令输出。
+
+    Returns:
+        飞书卡片消息的 content JSON 字符串。
+    """
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "green",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": content,
+                },
+            }
+        ],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
 def build_error_card(error_message: str) -> str:
     """构建错误提示卡片。
 

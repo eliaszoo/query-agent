@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, Response
 
 from src.config import load_config
 from src.feishu_session import FeishuSessionManager
-from src.feishu_message import build_query_card, build_error_card
+from src.feishu_message import build_query_card, build_error_card, build_command_card
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,13 @@ class FeishuBotService:
         lock = self._session_manager.get_lock(user_id)
         async with lock:
             try:
+                # 检查是否为 slash 命令
+                if text.startswith("/"):
+                    card_content = await self._handle_slash_command(text, user_id)
+                    if card_content:
+                        await self._send_card_message(chat_id, card_content)
+                        return
+
                 agent = self._session_manager.get_agent(user_id)
                 result = await agent.run_query(text)
                 metrics = agent.last_metrics
@@ -176,6 +183,256 @@ class FeishuBotService:
                 logger.error("查询处理失败: user=%s error=%s", user_id, e, exc_info=True)
                 error_card = build_error_card(f"查询处理失败: {e}")
                 await self._send_card_message(chat_id, error_card)
+
+    async def _handle_slash_command(self, text: str, user_id: str) -> str | None:
+        """处理飞书中的 slash 命令。
+
+        Args:
+            text: 完整命令文本，如 "/list"。
+            user_id: 飞书用户 open_id。
+
+        Returns:
+            卡片 JSON 字符串，或 None（不识别的命令交给 LLM 处理）。
+        """
+        parts = text.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+        agent = self._session_manager.get_agent(user_id)
+
+        if cmd == "/list":
+            return await self._cmd_list(agent)
+        if cmd == "/memory":
+            return self._cmd_memory(agent)
+        if cmd == "/clear":
+            return self._cmd_clear(agent, args)
+        if cmd == "/new":
+            agent.clear_history()
+            return build_command_card("新会话", "已开始新的对话。")
+        if cmd == "/business":
+            return self._cmd_business(agent, args)
+        if cmd == "/fields":
+            return self._cmd_fields(agent)
+        if cmd == "/field":
+            return self._cmd_field(agent, args)
+        if cmd == "/field_rm":
+            return self._cmd_field_rm(agent, args)
+        if cmd == "/rules":
+            return self._cmd_rules(agent)
+        if cmd == "/rules_clear":
+            return self._cmd_rules_clear(agent, args)
+        if cmd == "/remember":
+            return self._cmd_remember(agent, args, user_id)
+        if cmd == "/prompt":
+            prompt = agent._last_system_prompt or agent._build_system_prompt()
+            return build_command_card("System Prompt", f"```\n{prompt}\n```")
+        if cmd == "/add":
+            return await self._cmd_add(agent, args)
+        if cmd == "/remove":
+            return await self._cmd_remove(agent, args)
+
+        # 不识别的命令，返回 None 让 LLM 处理
+        return None
+
+    async def _cmd_list(self, agent) -> str:
+        """处理 /list 命令。"""
+        if not agent.list_businesses() and agent.mcp_servers:
+            try:
+                await agent._ensure_knowledge_loaded()
+            except Exception:
+                pass
+
+        lines = []
+        servers = agent.mcp_servers
+        if servers:
+            lines.append("**MCP Servers:**")
+            for s in servers:
+                lines.append(f"  - {s.name} ({s.url})")
+
+        businesses = agent.list_businesses()
+        if businesses:
+            lines.append("\n**Businesses:**")
+            for b in businesses:
+                status = "loaded" if b.knowledge else "pending"
+                cluster_labels = [
+                    f"{c} ({b.cluster_descriptions[c]})" if b.cluster_descriptions.get(c) else c
+                    for c in b.cluster_routing.keys()
+                ] if b.cluster_routing else ["pending"]
+                clusters = ", ".join(cluster_labels)
+                lines.append(f"  - **{b.name}** ({b.display_name}) [{status}]")
+                lines.append(f"    clusters: {clusters}")
+
+        if not servers and not businesses:
+            lines.append("No MCP Servers configured. Use /add to add one.")
+
+        return build_command_card("MCP Servers & Businesses", "\n".join(lines))
+
+    def _cmd_memory(self, agent) -> str:
+        """处理 /memory 命令。"""
+        entries = [e for e in agent.get_error_memory_entries() if e.error_type != "USER_FEEDBACK"]
+        if not entries:
+            return build_command_card("Error Memory", "No error memory.")
+
+        lines = []
+        businesses = agent.get_error_memory_businesses()
+        for biz in businesses:
+            biz_entries = [e for e in entries if e.business == biz]
+            lines.append(f"**{biz}** ({len(biz_entries)}):")
+            for i, e in enumerate(biz_entries, 1):
+                lines.append(f"  {i}. [{e.error_type}] {e.lesson}")
+        general = [e for e in entries if not e.business]
+        if general:
+            lines.append(f"\n**general** ({len(general)}):")
+            for i, e in enumerate(general, 1):
+                lines.append(f"  {i}. [{e.error_type}] {e.lesson}")
+
+        return build_command_card("Error Memory", "\n".join(lines))
+
+    def _cmd_clear(self, agent, args: list[str]) -> str:
+        """处理 /clear 命令。"""
+        if args:
+            biz_name = args[0]
+            agent.clear_error_memory(business=biz_name)
+            return build_command_card("Clear Memory", f"Cleared memory for business '{biz_name}'")
+        agent.clear_error_memory()
+        return build_command_card("Clear Memory", "Cleared all error memory")
+
+    def _cmd_business(self, agent, args: list[str]) -> str:
+        """处理 /business 命令。"""
+        if not args or args[0] == "current":
+            current = agent.get_locked_business()
+            if current:
+                return build_command_card("Business", f"Locked: {current}")
+            return build_command_card("Business", "No locked business in current session.")
+
+        if args[0] == "set":
+            if len(args) < 2:
+                return build_command_card("Business", "Usage: /business set <name>")
+            try:
+                agent.lock_business(args[1])
+                return build_command_card("Business", f"Locked: {args[1]}")
+            except KeyError as e:
+                return build_error_card(str(e))
+
+        if args[0] == "clear":
+            agent.clear_locked_business()
+            return build_command_card("Business", "Cleared locked business")
+
+        return build_command_card("Business", "Usage: /business current | set <name> | clear")
+
+    def _cmd_fields(self, agent) -> str:
+        """处理 /fields 命令。"""
+        entries = agent.list_field_knowledge()
+        if not entries:
+            return build_command_card("Field Knowledge", "No field knowledge recorded.")
+
+        lines = []
+        table_groups: dict[str, list] = {}
+        for e in entries:
+            table_groups.setdefault(e.table, []).append(e)
+        for table, fields in sorted(table_groups.items()):
+            lines.append(f"**{table}:**")
+            for f in fields:
+                lines.append(f"  {f.column}: {f.description}")
+
+        return build_command_card("Field Knowledge", "\n".join(lines))
+
+    def _cmd_field(self, agent, args: list[str]) -> str:
+        """处理 /field 命令。"""
+        if len(args) < 2:
+            return build_command_card("Field Knowledge", "Usage: /field <table>.<column> <description>")
+        field_key = args[0]
+        if "." not in field_key:
+            return build_error_card("Field key must be in table.column format")
+        table, column = field_key.split(".", 1)
+        description = " ".join(args[1:])
+        business = agent.get_last_business()
+        agent.add_field_knowledge(business, table, column, description)
+        return build_command_card("Field Knowledge", f"Added: {table}.{column}: {description}")
+
+    def _cmd_field_rm(self, agent, args: list[str]) -> str:
+        """处理 /field_rm 命令。"""
+        if len(args) < 1:
+            return build_command_card("Field Knowledge", "Usage: /field_rm <table>.<column>")
+        field_key = args[0]
+        if "." not in field_key:
+            return build_error_card("Field key must be in table.column format")
+        table, column = field_key.split(".", 1)
+        business = agent.get_last_business()
+        removed = agent.remove_field_knowledge(business, table, column)
+        if removed:
+            return build_command_card("Field Knowledge", f"Removed: {table}.{column}")
+        return build_command_card("Field Knowledge", f"Not found: {table}.{column}")
+
+    def _cmd_rules(self, agent) -> str:
+        """处理 /rules 命令。"""
+        rules = agent.list_preference_rules()
+        if not rules:
+            return build_command_card("Default Rules", "No default query rules.")
+
+        lines = []
+        for idx, rule in enumerate(rules, 1):
+            biz = rule.business or "general"
+            lines.append(f"{idx}. [{biz}] {rule.rule}")
+
+        return build_command_card("Default Rules", "\n".join(lines))
+
+    def _cmd_rules_clear(self, agent, args: list[str]) -> str:
+        """处理 /rules_clear 命令。"""
+        if args:
+            biz_name = args[0]
+            agent.clear_preference_rules(biz_name)
+            return build_command_card("Clear Rules", f"Cleared default rules for business '{biz_name}'")
+        agent.clear_preference_rules()
+        return build_command_card("Clear Rules", "Cleared all default rules")
+
+    def _cmd_remember(self, agent, args: list[str], user_id: str) -> str:
+        """处理 /remember 命令。"""
+        rule = " ".join(args).strip()
+        if not rule:
+            return build_command_card("Remember", "Usage: /remember <default query rule>")
+        business = agent.get_last_business()
+        if not business:
+            return build_command_card("Remember", "No business context. Run a query first or use /business set <name>.")
+        agent.add_preference_rule(business, rule, source="feishu")
+        return build_command_card("Remember", f"Saved default rule: [{business}] {rule}")
+
+    async def _cmd_add(self, agent, args: list[str]) -> str:
+        """处理 /add 命令。"""
+        if len(args) < 2:
+            return build_command_card("Add Server", "Usage: /add <server_name> <sse_url> [api_key]")
+
+        name = args[0]
+        url = args[1]
+        api_key = args[2] if len(args) > 2 else ""
+
+        await agent.add_mcp_server(name, url, api_key=api_key)
+
+        businesses = agent.list_businesses()
+        lines = [f"Added MCP Server: {name} ({url})"]
+        if businesses:
+            lines.append("\nDiscovered businesses:")
+            for b in businesses:
+                cluster_labels = [
+                    f"{c} ({b.cluster_descriptions[c]})" if b.cluster_descriptions.get(c) else c
+                    for c in b.cluster_routing.keys()
+                ] if b.cluster_routing else ["pending"]
+                clusters = ", ".join(cluster_labels)
+                lines.append(f"  - {b.name} ({b.display_name}) clusters: {clusters}")
+
+        return build_command_card("Add Server", "\n".join(lines))
+
+    async def _cmd_remove(self, agent, args: list[str]) -> str:
+        """处理 /remove 命令。"""
+        if len(args) < 1:
+            return build_command_card("Remove Server", "Usage: /remove <server_name>")
+
+        name = args[0]
+        server_names = [s.name for s in agent.mcp_servers]
+        if name not in server_names:
+            return build_error_card(f"MCP Server '{name}' not found. Available: {', '.join(server_names) or 'none'}")
+
+        await agent.remove_mcp_server(name)
+        return build_command_card("Remove Server", f"Removed MCP Server: {name}")
 
     async def _send_card_message(self, chat_id: str, card_content: str) -> None:
         """发送卡片消息到飞书群聊。
