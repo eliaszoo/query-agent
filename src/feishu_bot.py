@@ -100,11 +100,10 @@ class FeishuBotService:
             body = await request.body()
 
             try:
-                raw_req = lark.RawRequest(
-                    uri=str(request.url),
-                    headers=headers,
-                    body=bytes(body),
-                )
+                raw_req = lark.RawRequest()
+                raw_req.uri = str(request.url)
+                raw_req.headers = headers
+                raw_req.body = bytes(body)
                 raw_resp = self._event_handler.do(raw_req)
                 return Response(
                     content=raw_resp.content,
