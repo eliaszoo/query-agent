@@ -115,7 +115,7 @@ class FeishuBotService:
                 "active_sessions": self._session_manager.active_session_count,
             }
 
-    def _on_message_receive(self, ctx: lark.Context, event: lark.im.v1.P2ImMessageReceiveV1) -> None:
+    def _on_message_receive(self, event: lark.im.v1.P2ImMessageReceiveV1) -> None:
         """处理 im.message.receive_v1 事件。
 
         从事件中提取用户消息，异步调用 QueryAgent 处理。
