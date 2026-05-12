@@ -74,8 +74,8 @@ class FeishuBotService:
 
         # 事件处理器
         self._event_handler = lark.EventDispatcherHandler.builder(
-            feishu_cfg.verification_token,
             feishu_cfg.encrypt_key,
+            feishu_cfg.verification_token,
         ).register_p2_im_message_receive_v1(self._on_message_receive).build()
 
         # FastAPI app
@@ -96,16 +96,24 @@ class FeishuBotService:
         @self._app.post("/webhook/event")
         async def handle_event(request: Request):
             """处理飞书事件回调。"""
-            headers = dict(request.headers)
+            headers = request.headers
             body = await request.body()
 
             try:
-                self._event_handler.handle(bytes(body), headers)
+                raw_req = lark.RawRequest(
+                    uri=str(request.url),
+                    headers=headers,
+                    body=bytes(body),
+                )
+                raw_resp = self._event_handler.do(raw_req)
+                return Response(
+                    content=raw_resp.content,
+                    status_code=raw_resp.status_code,
+                    media_type="application/json",
+                )
             except Exception as e:
                 logger.error("处理飞书事件失败: %s", e, exc_info=True)
-
-            # 飞书要求 3 秒内返回 HTTP 200
-            return Response(status_code=200)
+                return Response(status_code=500)
 
         @self._app.get("/health")
         async def health_check():
