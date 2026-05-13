@@ -17,7 +17,22 @@ from src.config import load_config
 from src.feishu_session import FeishuSessionManager
 from src.feishu_message import build_query_card, build_error_card, build_command_card
 
+# 飞书签名相关 header，encrypt_key 未配置时需移除以绕过 SDK 签名校验
+_LARK_SIGN_HEADERS = {"x-lark-signature", "x-lark-request-timestamp", "x-lark-request-nonce"}
+
 logger = logging.getLogger(__name__)
+
+
+def _strip_lark_sign_headers(headers) -> dict:
+    """移除飞书签名相关 header，用于 encrypt_key 未配置时绕过 SDK 签名校验。
+
+    lark_oapi 的 RawRequest.headers 可能是 Starlette Headers 或普通 dict，
+    统一转为 dict 并移除签名 header。
+    """
+    if hasattr(headers, "items"):
+        return {k: v for k, v in headers.items() if k.lower() not in _LARK_SIGN_HEADERS}
+    # 兜容：不可迭代时原样返回
+    return headers
 
 
 def _extract_text_from_event(event_data: dict) -> str:
@@ -72,10 +87,13 @@ class FeishuBotService:
             session_ttl=feishu_cfg.session_ttl,
         )
 
+        # encrypt_key 是否已配置 — 未配置时需绕过 SDK 签名校验
+        self._encrypt_key_configured = bool(feishu_cfg.encrypt_key)
+
         # 事件处理器
         self._event_handler = lark.EventDispatcherHandler.builder(
-            feishu_cfg.encrypt_key,
-            feishu_cfg.verification_token,
+            feishu_cfg.encrypt_key or "",
+            feishu_cfg.verification_token or "",
         ).register_p2_im_message_receive_v1(self._on_message_receive).build()
 
         # FastAPI app
@@ -104,6 +122,12 @@ class FeishuBotService:
                 raw_req.uri = str(request.url)
                 raw_req.headers = headers
                 raw_req.body = bytes(body)
+
+                # encrypt_key 未配置时，飞书仍会发送签名 header，
+                # 但 SDK 要求 encrypt_key 才能验签，所以提前移除签名 header 绕过校验
+                if not self._encrypt_key_configured:
+                    raw_req.headers = _strip_lark_sign_headers(raw_req.headers)
+
                 raw_resp = self._event_handler.do(raw_req)
                 return Response(
                     content=raw_resp.content,
