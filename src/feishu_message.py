@@ -74,10 +74,6 @@ def _build_metrics_header(title: str, metrics: QueryMetrics | None, context: dic
             subtitle_parts.append(f"集群: {context['cluster']}")
         if metrics.duration_seconds:
             subtitle_parts.append(f"耗时: {metrics.duration_seconds}s")
-        if metrics.input_tokens or metrics.output_tokens:
-            subtitle_parts.append(f"{metrics.input_tokens}+ {metrics.output_tokens}-")
-        if metrics.tool_calls:
-            subtitle_parts.append(f"{metrics.tool_calls} tool calls")
         if metrics.model:
             subtitle_parts.append(f"模型: {metrics.model}")
         subtitle = " | ".join(subtitle_parts) if subtitle_parts else ""
