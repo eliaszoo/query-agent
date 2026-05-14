@@ -148,9 +148,11 @@ class FeishuBotService:
                         media_type="application/json",
                     )
 
-                # 卡片交互回调：解析 action.value
+                # 卡片交互回调
+                logger.info("卡片交互回调: %s", json.dumps(data, ensure_ascii=False)[:500])
+
                 action = data.get("action", {})
-                value = action.get("value", {})
+                value = action.get("value", {}) if isinstance(action, dict) else {}
                 confirm_id = value.get("confirm_id", "")
                 approved = value.get("approved", False)
 
@@ -161,6 +163,20 @@ class FeishuBotService:
                         logger.info("卡片按钮回调: confirm_id=%s approved=%s", confirm_id, approved)
                     else:
                         logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
+
+                    # 返回更新后的卡片（去掉按钮，显示操作结果）
+                    status_text = "✅ 已继续执行" if approved else "❌ 已取消"
+                    updated_card = json.dumps({
+                        "config": {"wide_screen_mode": True},
+                        "header": {
+                            "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
+                            "template": "green" if approved else "grey",
+                        },
+                        "elements": [
+                            {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
+                        ],
+                    }, ensure_ascii=False)
+                    return Response(content=updated_card, media_type="application/json")
 
                 return Response(
                     content=json.dumps({"msg": "success"}),
