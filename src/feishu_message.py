@@ -39,12 +39,13 @@ def _parse_markdown_table(md_text: str) -> list[list[str]] | None:
     return [header] + rows
 
 
-def build_query_card(result: str, metrics: QueryMetrics | None = None) -> str:
+def build_query_card(result: str, metrics: QueryMetrics | None = None, context: dict | None = None) -> str:
     """将查询结果构建为飞书交互卡片 JSON 字符串。
 
     Args:
         result: QueryAgent 的文本输出。
         metrics: 查询元信息（可选）。
+        context: 查询上下文（含 cluster 等，可选）。
 
     Returns:
         飞书卡片消息的 content JSON 字符串。
@@ -53,21 +54,30 @@ def build_query_card(result: str, metrics: QueryMetrics | None = None) -> str:
     table_data = _parse_markdown_table(result)
 
     if table_data and len(table_data) >= 2:
-        card = _build_table_card(table_data, result, metrics)
+        card = _build_table_card(table_data, result, metrics, context)
     else:
-        card = _build_text_card(result, metrics)
+        card = _build_text_card(result, metrics, context)
 
     return json.dumps(card, ensure_ascii=False)
 
 
-def _build_metrics_header(title: str, metrics: QueryMetrics | None) -> dict:
+def _build_metrics_header(title: str, metrics: QueryMetrics | None, context: dict | None = None) -> dict:
     """构建卡片 header，包含查询元信息。"""
     if metrics:
         subtitle_parts = []
         if metrics.selected_business:
-            subtitle_parts.append(f"业务: {metrics.selected_business}")
+            biz = metrics.selected_business
+            if metrics.business_selection_strategy:
+                biz += f" via {metrics.business_selection_strategy}"
+            subtitle_parts.append(f"业务: {biz}")
+        if context and context.get("cluster"):
+            subtitle_parts.append(f"集群: {context['cluster']}")
         if metrics.duration_seconds:
             subtitle_parts.append(f"耗时: {metrics.duration_seconds}s")
+        if metrics.input_tokens or metrics.output_tokens:
+            subtitle_parts.append(f"{metrics.input_tokens}+ {metrics.output_tokens}-")
+        if metrics.tool_calls:
+            subtitle_parts.append(f"{metrics.tool_calls} tool calls")
         if metrics.model:
             subtitle_parts.append(f"模型: {metrics.model}")
         subtitle = " | ".join(subtitle_parts) if subtitle_parts else ""
@@ -85,7 +95,8 @@ def _build_metrics_header(title: str, metrics: QueryMetrics | None) -> dict:
 
 
 def _build_table_card(
-    table_data: list[list[str]], raw_result: str, metrics: QueryMetrics | None
+    table_data: list[list[str]], raw_result: str, metrics: QueryMetrics | None,
+    context: dict | None = None,
 ) -> dict:
     """构建包含表格的飞书卡片。"""
     header_row = table_data[0]
@@ -172,16 +183,16 @@ def _build_table_card(
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": _build_metrics_header("查询结果", metrics),
+        "header": _build_metrics_header("查询结果", metrics, context),
         "elements": elements,
     }
 
 
-def _build_text_card(result: str, metrics: QueryMetrics | None) -> dict:
+def _build_text_card(result: str, metrics: QueryMetrics | None, context: dict | None = None) -> dict:
     """构建纯文本飞书卡片。"""
     return {
         "config": {"wide_screen_mode": True},
-        "header": _build_metrics_header("查询结果", metrics),
+        "header": _build_metrics_header("查询结果", metrics, context),
         "elements": [
             {
                 "tag": "div",

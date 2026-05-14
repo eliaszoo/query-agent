@@ -274,7 +274,8 @@ class FeishuBotService:
                     agent._tool_execution._confirm_callback = original_confirm
 
                 metrics = agent.last_metrics
-                card_content = build_query_card(result, metrics)
+                context = agent._conversation.last_query_context
+                card_content = build_query_card(result, metrics, context)
                 await self._send_card_message(chat_id, card_content, message_id=message_id)
 
             except Exception as e:
