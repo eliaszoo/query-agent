@@ -1256,10 +1256,20 @@ class QueryAgent:
                 # 执行前检查（打印 SQL、性能风险检测、用户确认）
                 cancel_result = await self._tool_execution.pre_execute_check(tc.name, tool_args)
                 if cancel_result is not None:
-                    # 用户拒绝执行，保存已有的对话过程到历史
-                    messages.append({"role": "assistant", "content": "查询已被用户取消。"})
-                    self._conversation.history = messages
-                    return "查询已被用户取消。"
+                    # 用户拒绝执行，补上取消的 tool result 保持消息序列一致
+                    tool_results.append(
+                        self.provider.build_tool_result_message(tc.id, cancel_result)
+                    )
+                    # 跳过后续 tool calls，统一处理
+                    for remaining_tc in (response.tool_calls or []):
+                        if remaining_tc.id != tc.id:
+                            tool_results.append(
+                                self.provider.build_tool_result_message(
+                                    remaining_tc.id,
+                                    json.dumps({"success": False, "error_message": "前置工具已取消"}, ensure_ascii=False),
+                                )
+                            )
+                    break
                 else:
                     result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)
                     if not tc_business and resolved_business:
