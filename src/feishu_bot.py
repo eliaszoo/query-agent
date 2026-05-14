@@ -233,7 +233,7 @@ class FeishuBotService:
 
     # ── 查询处理 ──
 
-    async def _add_reaction(self, message_id: str, emoji: str = "👀") -> None:
+    async def _add_reaction(self, message_id: str, emoji: str = "EYES") -> None:
         """给消息添加表情反馈。"""
         if not message_id:
             return
@@ -258,7 +258,7 @@ class FeishuBotService:
         async with lock:
             try:
                 # 即时反馈：给用户消息加表情
-                await self._add_reaction(message_id, "👀")
+                await self._add_reaction(message_id, "EYES")
 
                 # Slash 命令
                 if text.startswith("/"):
