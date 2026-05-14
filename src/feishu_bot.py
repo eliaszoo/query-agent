@@ -142,8 +142,25 @@ class FeishuBotService:
 
         @self._app.post("/webhook/card")
         async def handle_card_action(request: Request):
-            headers = request.headers
             body = await request.body()
+
+            # Debug: 打印签名校验参数以便排查
+            signature = request.headers.get("x-lark-signature", "")
+            timestamp = request.headers.get("x-lark-request-timestamp", "")
+            nonce = request.headers.get("x-lark-request-nonce", "")
+            if signature:
+                import hashlib as _hl
+                token = feishu_cfg.verification_token or ""
+                bs = (timestamp + nonce + token).encode() + body
+                expected = _hl.sha1(bs).hexdigest()
+                logger.info(
+                    "Card sign debug: received=%s computed=%s match=%s "
+                    "timestamp=%s nonce=%s token_len=%d body_len=%d body_start=%s",
+                    signature[:16], expected[:16], signature == expected,
+                    timestamp, nonce[:8] if nonce else "",
+                    len(token), len(body),
+                    body[:100].decode("utf-8", errors="replace") if body else "",
+                )
 
             try:
                 raw_req = lark.RawRequest()
