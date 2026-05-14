@@ -90,12 +90,6 @@ class FeishuBotService:
             self._on_message_receive
         ).build()
 
-        # 卡片交互处理器（独立路由）
-        self._card_handler = lark.CardActionHandler.builder(
-            feishu_cfg.encrypt_key or "",
-            feishu_cfg.verification_token or "",
-        ).register(self._on_card_action).build()
-
         # FastAPI app
         self._app = FastAPI(title="query-agent-feishu-bot")
         self._setup_routes()
@@ -144,34 +138,32 @@ class FeishuBotService:
         async def handle_card_action(request: Request):
             body = await request.body()
 
-            # Debug: 打印签名校验参数以便排查
-            signature = request.headers.get("x-lark-signature", "")
-            timestamp = request.headers.get("x-lark-request-timestamp", "")
-            nonce = request.headers.get("x-lark-request-nonce", "")
-            if signature:
-                import hashlib as _hl
-                token = feishu_cfg.verification_token or ""
-                bs = (timestamp + nonce + token).encode() + body
-                expected = _hl.sha1(bs).hexdigest()
-                logger.info(
-                    "Card sign debug: received=%s computed=%s match=%s "
-                    "timestamp=%s nonce=%s token_len=%d body_len=%d body_start=%s",
-                    signature[:16], expected[:16], signature == expected,
-                    timestamp, nonce[:8] if nonce else "",
-                    len(token), len(body),
-                    body[:100].decode("utf-8", errors="replace") if body else "",
-                )
-
             try:
-                raw_req = lark.RawRequest()
-                raw_req.uri = str(request.url)
-                raw_req.headers = request.headers
-                raw_req.body = bytes(body)
+                data = json.loads(body)
 
-                raw_resp = self._card_handler.do(raw_req)
+                # URL verification (challenge)
+                if data.get("type") == "url_verification":
+                    return Response(
+                        content=json.dumps({"challenge": data.get("challenge", "")}),
+                        media_type="application/json",
+                    )
+
+                # 卡片交互回调：解析 action.value
+                action = data.get("action", {})
+                value = action.get("value", {})
+                confirm_id = value.get("confirm_id", "")
+                approved = value.get("approved", False)
+
+                if confirm_id:
+                    future = self._pending_confirms.pop(confirm_id, None)
+                    if future and not future.done():
+                        future.set_result(approved)
+                        logger.info("卡片按钮回调: confirm_id=%s approved=%s", confirm_id, approved)
+                    else:
+                        logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
+
                 return Response(
-                    content=raw_resp.content,
-                    status_code=raw_resp.status_code,
+                    content=json.dumps({"msg": "success"}),
                     media_type="application/json",
                 )
             except Exception as e:
@@ -214,27 +206,6 @@ class FeishuBotService:
 
         except Exception as e:
             logger.error("处理消息事件失败: %s", e, exc_info=True)
-
-    def _on_card_action(self, card: lark.Card) -> None:
-        """处理卡片交互按钮回调（高风险确认）。"""
-        try:
-            action = card.action
-            value = (action.value or {}) if action else {}
-            confirm_id = value.get("confirm_id", "")
-            approved = value.get("approved", False)
-
-            if not confirm_id:
-                return
-
-            future = self._pending_confirms.pop(confirm_id, None)
-            if future and not future.done():
-                future.set_result(approved)
-                logger.info("卡片按钮回调: confirm_id=%s approved=%s", confirm_id, approved)
-            else:
-                logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
-
-        except Exception as e:
-            logger.error("处理卡片交互失败: %s", e, exc_info=True)
 
     @staticmethod
     def _on_task_done(task: asyncio.Task) -> None:
