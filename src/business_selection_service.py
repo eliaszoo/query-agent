@@ -42,7 +42,7 @@ class BusinessSelectionService:
             )
 
         try:
-            llm_match = self._select_with_llm(user_input, businesses)
+            llm_match = await self._select_with_llm(user_input, businesses)
             if llm_match is not None:
                 return BusinessSelectionResult(
                     business=llm_match,
@@ -85,7 +85,7 @@ class BusinessSelectionService:
             return matches[0]
         return None
 
-    def _select_with_llm(self, user_input: str, businesses: list):
+    async def _select_with_llm(self, user_input: str, businesses: list):
         business_lines = []
         for entry in businesses:
             description = (
@@ -105,7 +105,7 @@ class BusinessSelectionService:
             f"用户查询：{user_input}\n\n"
             "只回答业务 name 或 NONE，不要输出其他内容。"
         )
-        response = self._provider.chat(
+        response = await self._provider.chat_async(
             model=self._model,
             max_tokens=50,
             system="你是一个业务路由助手，只做业务识别。",

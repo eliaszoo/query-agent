@@ -64,6 +64,8 @@ class AgentConfig:
     provider: str = "anthropic"  # "anthropic" 或 "openai_compatible"
     api_key: str = ""  # API 密钥，为空则从环境变量读取
     base_url: str = ""  # API 地址，仅 openai_compatible 需要
+    timeout: int = 120  # LLM API 请求超时（秒）
+    max_retries: int = 2  # 超时/限流最大重试次数
 
 
 @dataclass
@@ -360,6 +362,8 @@ def _build_app_config(raw: dict) -> AppConfig:
         provider=agent_raw.get("provider", "anthropic"),
         api_key=agent_raw.get("api_key", ""),
         base_url=agent_raw.get("base_url", ""),
+        timeout=int(agent_raw.get("timeout", 120)),
+        max_retries=int(agent_raw.get("max_retries", 2)),
     )
 
     # 构建业务知识配置

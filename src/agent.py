@@ -244,6 +244,8 @@ class QueryAgent:
             provider=self.config.agent.provider,
             api_key=self.config.agent.api_key or None,
             base_url=self.config.agent.base_url or None,
+            timeout=self.config.agent.timeout,
+            max_retries=self.config.agent.max_retries,
         )
         self.last_metrics: Optional[QueryMetrics] = None
 
@@ -1189,7 +1191,7 @@ class QueryAgent:
         self._last_system_prompt = system_prompt
 
         while True:
-            response = self.provider.chat(
+            response = await self.provider.chat_async(
                 model=self.config.agent.model,
                 max_tokens=self.config.agent.max_tokens,
                 system=system_prompt,
@@ -1383,7 +1385,7 @@ class QueryAgent:
         )
 
         try:
-            response = self.provider.chat(
+            response = await self.provider.chat_async(
                 model=self.config.agent.model,
                 max_tokens=200,
                 system="你是一个经验提取助手，从用户反馈中提取简洁的经验教训。",
