@@ -140,7 +140,12 @@ class FeishuBotService:
 
             try:
                 data = json.loads(body)
-                logger.info("卡片交互回调 body: %s", json.dumps(data, ensure_ascii=False)[:500])
+                print(f"[CARD-CALLBACK] keys={list(data.keys())} action={json.dumps(data.get('action'), ensure_ascii=False)[:300]}")
+
+                # 加密 body：只有 encrypt 字段，需解密（encrypt_key 未配置时跳过）
+                if "encrypt" in data and not data.get("action"):
+                    print("[CARD-CALLBACK] body encrypted, cannot decrypt")
+                    return Response(status_code=200)
 
                 # URL verification (challenge)
                 if data.get("type") == "url_verification":
@@ -151,9 +156,8 @@ class FeishuBotService:
 
                 # 卡片交互回调
                 action = data.get("action", {})
-                logger.info("卡片交互 action: %s, keys=%s", json.dumps(action, ensure_ascii=False)[:300],
-                            list(data.keys()))
                 value = action.get("value", {}) if isinstance(action, dict) else {}
+                print(f"[CARD-CALLBACK] value={json.dumps(value, ensure_ascii=False)[:200]} confirm_id={value.get('confirm_id', '')}")
                 confirm_id = value.get("confirm_id", "")
                 approved = value.get("approved", False)
 
