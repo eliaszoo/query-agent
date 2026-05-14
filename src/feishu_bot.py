@@ -140,6 +140,7 @@ class FeishuBotService:
 
             try:
                 data = json.loads(body)
+                logger.info("卡片交互回调 body: %s", json.dumps(data, ensure_ascii=False)[:500])
 
                 # URL verification (challenge)
                 if data.get("type") == "url_verification":
@@ -149,9 +150,9 @@ class FeishuBotService:
                     )
 
                 # 卡片交互回调
-                logger.info("卡片交互回调: %s", json.dumps(data, ensure_ascii=False)[:500])
-
                 action = data.get("action", {})
+                logger.info("卡片交互 action: %s, keys=%s", json.dumps(action, ensure_ascii=False)[:300],
+                            list(data.keys()))
                 value = action.get("value", {}) if isinstance(action, dict) else {}
                 confirm_id = value.get("confirm_id", "")
                 approved = value.get("approved", False)
