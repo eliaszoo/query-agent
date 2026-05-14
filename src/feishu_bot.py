@@ -148,11 +148,8 @@ class FeishuBotService:
             try:
                 raw_req = lark.RawRequest()
                 raw_req.uri = str(request.url)
+                raw_req.headers = headers
                 raw_req.body = bytes(body)
-                if not self._encrypt_key_configured:
-                    raw_req.headers = _strip_lark_sign_headers(headers)
-                else:
-                    raw_req.headers = headers
 
                 raw_resp = self._card_handler.do(raw_req)
                 return Response(
@@ -233,7 +230,7 @@ class FeishuBotService:
 
     # ── 查询处理 ──
 
-    async def _add_reaction(self, message_id: str, emoji: str = "THINK") -> None:
+    async def _add_reaction(self, message_id: str, emoji: str = "SMILE") -> None:
         """给消息添加表情反馈。表情添加失败时静默忽略（可能缺少 im:reaction 权限）。"""
         if not message_id:
             return
