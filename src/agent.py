@@ -5,6 +5,7 @@
 通过 BusinessRegistry 管理多个业务的 MCP Server 连接，LLM 自动路由。
 """
 
+import asyncio
 import json as _json
 import logging
 import os
@@ -1030,7 +1031,7 @@ class QueryAgent:
         aggregated_clusters = list(entry.cluster_routing.keys())
         return _prepare_business_tools(tools, aggregated_clusters)
 
-    async def run_query(self, user_input: str) -> str:
+    async def run_query(self, user_input: str, on_sql_preview=None) -> str:
         """发送用户查询并返回 Agent 的最终文本响应。
 
         根据业务模式选择执行方式：
@@ -1039,12 +1040,20 @@ class QueryAgent:
 
         Args:
             user_input: 用户的自然语言查询。
+            on_sql_preview: 可选的 async callback，SQL 预览时调用。
+                签名: async (sql, cluster, risk_level, risk_reasons) -> None
 
         Returns:
             Agent 的最终文本响应。
         """
         start_time = time.time()
         metrics = QueryMetrics(model=self.config.agent.model)
+
+        # 设置 SQL 预览回调
+        if on_sql_preview:
+            self._tool_execution.set_sql_preview_callback(on_sql_preview)
+        else:
+            self._tool_execution.set_sql_preview_callback(None)
 
         if self._is_stdio_mode:
             metrics.selected_business = "default"
@@ -1159,10 +1168,11 @@ class QueryAgent:
             logger.debug("从 MCP Server 获取业务知识失败，使用本地配置", exc_info=True)
 
     @staticmethod
-    def _default_confirm(prompt: str) -> bool:
+    async def _default_confirm(**kwargs) -> bool:
         """默认确认回调，使用标准输入。"""
-        answer = input(f"   {prompt}").strip().lower()
-        return answer == "y"
+        prompt = "是否继续执行？(y/N): "
+        answer = await asyncio.to_thread(input, f"   {prompt}")
+        return answer.strip().lower() == "y"
 
     async def _conversation_loop_core(
         self,

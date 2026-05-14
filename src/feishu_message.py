@@ -266,3 +266,126 @@ def build_thinking_card() -> str:
         "elements": [],
     }
     return json.dumps(card, ensure_ascii=False)
+
+
+def build_sql_preview_card(
+    sql: str, cluster: str = "",
+    risk_level: str = "", risk_reasons: list[str] | None = None,
+) -> str:
+    """构建 SQL 预览卡片。
+
+    Args:
+        sql: 将要执行的 SQL 语句。
+        cluster: 目标集群。
+        risk_level: 风险等级 ("high"/"medium"/"")。
+        risk_reasons: 风险原因列表。
+
+    Returns:
+        飞书卡片消息的 content JSON 字符串。
+    """
+    # 颜色根据风险等级
+    template = {"high": "red", "medium": "orange"}.get(risk_level, "blue")
+    title = {"high": "高风险 SQL 预览", "medium": "SQL 预览（中风险）"}.get(
+        risk_level, "SQL 预览"
+    )
+
+    elements: list[dict] = []
+
+    # SQL 代码块
+    sql_display = sql[:2000]  # 限制长度
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"**集群**: {cluster or '默认'}\n```sql\n{sql_display}\n```",
+        },
+    })
+
+    # 风险提示
+    if risk_reasons:
+        risk_lines = "\n".join(f"- {r}" for r in risk_reasons)
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**风险 [{risk_level}]**:\n{risk_lines}",
+            },
+        })
+
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": template,
+        },
+        "elements": elements,
+    }, ensure_ascii=False)
+
+
+def build_risk_confirm_card(
+    sql: str, cluster: str = "",
+    risk_level: str = "high", risk_reasons: list[str] | None = None,
+    confirm_id: str = "",
+) -> str:
+    """构建高风险 SQL 确认卡片（带按钮）。
+
+    Args:
+        sql: 将要执行的 SQL 语句。
+        cluster: 目标集群。
+        risk_level: 风险等级。
+        risk_reasons: 风险原因列表。
+        confirm_id: 确认 ID，用于按钮回调路由。
+
+    Returns:
+        飞书交互卡片消息的 content JSON 字符串。
+    """
+    elements: list[dict] = []
+
+    # SQL 代码块
+    sql_display = sql[:2000]
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"**集群**: {cluster or '默认'}\n```sql\n{sql_display}\n```",
+        },
+    })
+
+    # 风险提示
+    if risk_reasons:
+        risk_lines = "\n".join(f"- {r}" for r in risk_reasons)
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**风险 [{risk_level}]**:\n{risk_lines}",
+            },
+        })
+
+    # 确认按钮
+    elements.append({
+        "tag": "action",
+        "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "继续执行"},
+                "type": "danger",
+                "value": {"confirm_id": confirm_id, "approved": True},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "取消"},
+                "type": "default",
+                "value": {"confirm_id": confirm_id, "approved": False},
+            },
+        ],
+    })
+
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
+            "template": "red",
+        },
+        "elements": elements,
+    }, ensure_ascii=False)

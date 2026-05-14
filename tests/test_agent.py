@@ -925,7 +925,9 @@ agent:
 
         # confirm_callback 返回 False（用户拒绝）
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
-            agent = QueryAgent(config_path=str(config_file), confirm_callback=lambda _: False)
+            async def _reject(**kwargs):
+                return False
+            agent = QueryAgent(config_path=str(config_file), confirm_callback=_reject)
 
         # 注入索引信息使 SQL 有风险
         from src.sql_risk_checker import IndexInfo
@@ -964,7 +966,9 @@ agent:
 
         # confirm_callback 返回 True（用户确认）
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
-            agent = QueryAgent(config_path=str(config_file), confirm_callback=lambda _: True)
+            async def _approve(**kwargs):
+                return True
+            agent = QueryAgent(config_path=str(config_file), confirm_callback=_approve)
 
         from src.sql_risk_checker import IndexInfo
         agent._risk_checker.update_indexes("default", "test", "tb_scene", [

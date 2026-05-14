@@ -23,12 +23,14 @@ class ToolExecutionService:
         confirm_callback,
         is_stdio_mode: bool,
         field_knowledge_manager,
+        sql_preview_callback=None,
     ) -> None:
         self._registry = registry
         self._risk_checker = risk_checker
         self._confirm_callback = confirm_callback
         self._is_stdio_mode = is_stdio_mode
         self._field_knowledge = field_knowledge_manager
+        self._sql_preview_callback = sql_preview_callback
         self._indexes_loaded = False
 
     @property
@@ -41,6 +43,10 @@ class ToolExecutionService:
 
     def set_field_knowledge_manager(self, field_knowledge_manager) -> None:
         self._field_knowledge = field_knowledge_manager
+
+    def set_sql_preview_callback(self, callback) -> None:
+        """设置 SQL 预览回调。"""
+        self._sql_preview_callback = callback
 
     async def ensure_indexes_loaded(self) -> None:
         """确保索引信息已加载到风险检测器中（多业务 SSE 模式）。"""
@@ -124,7 +130,7 @@ class ToolExecutionService:
             logger.debug("解析索引信息失败", exc_info=True)
 
     async def pre_execute_check(self, tool_name: str, arguments: dict) -> str | None:
-        """执行前检查：打印 SQL，检测性能风险，等待确认。"""
+        """执行前检查：发送 SQL 预览，检测性能风险，等待确认。"""
         if tool_name != "execute_readonly_sql":
             return None
 
@@ -133,8 +139,7 @@ class ToolExecutionService:
         business = arguments.get("business", "") if isinstance(arguments, dict) else ""
         risk_note = arguments.get("risk_note", "") if isinstance(arguments, dict) else ""
 
-        print(f"  SQL ({cluster}): {sql}")
-
+        # 风险评估
         if risk_note:
             risk_level, reasons = self.parse_risk_note(risk_note)
         else:
@@ -143,12 +148,26 @@ class ToolExecutionService:
             risk_level = risk_result.risk_level
             reasons = risk_result.risk_reasons
 
-        if reasons:
-            print(f"  Risk [{risk_level}]:")
-            for reason in reasons:
-                print(f"    - {reason}")
+        # 发送 SQL 预览（飞书模式用 callback，stdio 模式用 print）
+        if self._sql_preview_callback:
+            await self._sql_preview_callback(
+                sql=sql, cluster=cluster,
+                risk_level=risk_level, risk_reasons=reasons,
+            )
+        else:
+            print(f"  SQL ({cluster}): {sql}")
+            if reasons:
+                print(f"  Risk [{risk_level}]:")
+                for reason in reasons:
+                    print(f"    - {reason}")
 
-            if not self._confirm_callback("是否继续执行？(y/N): "):
+        # 高风险确认
+        if reasons and self._confirm_callback:
+            confirmed = await self._confirm_callback(
+                sql=sql, cluster=cluster,
+                risk_level=risk_level, risk_reasons=reasons,
+            )
+            if not confirmed:
                 return json.dumps({
                     "success": False,
                     "error_type": "USER_CANCELLED",

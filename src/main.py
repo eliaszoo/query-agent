@@ -254,13 +254,14 @@ class Spinner:
 _active_spinner: Spinner | None = None
 
 
-def _confirm_with_spinner(prompt: str) -> bool:
+async def _confirm_with_spinner(**kwargs) -> bool:
     """确认回调：暂停 spinner → 等待用户输入 → 恢复 spinner。"""
+    prompt = "是否继续执行？(y/N): "
     if _active_spinner:
         _active_spinner.pause()
     try:
-        answer = input(f"   {prompt}").strip().lower()
-        return answer == "y"
+        answer = await asyncio.to_thread(input, f"   {prompt}")
+        return answer.strip().lower() == "y"
     finally:
         if _active_spinner:
             _active_spinner.resume()
