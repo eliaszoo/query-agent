@@ -148,22 +148,25 @@ class ToolExecutionService:
             risk_level = risk_result.risk_level
             reasons = risk_result.risk_reasons
 
-        # 发送 SQL 预览 / 高风险确认
-        # 当有风险 + 确认回调时，确认回调会发合并卡片（含 SQL + 风险 + 按钮），跳过单独预览
-        has_confirm_with_risk = reasons and self._confirm_callback
-        if self._sql_preview_callback and not has_confirm_with_risk:
-            await self._sql_preview_callback(
-                sql=sql, cluster=cluster,
-                risk_level=risk_level, risk_reasons=reasons,
-            )
-        elif not self._sql_preview_callback:
-            print(f"  SQL ({cluster}): {sql}")
-            if reasons:
-                print(f"  Risk [{risk_level}]:")
-                for reason in reasons:
-                    print(f"    - {reason}")
+        # 发送 SQL 预览
+        # 飞书模式：有风险+确认回调时跳过单独预览（确认卡片已含 SQL+风险+按钮）
+        # stdio 模式：始终先 print SQL，再确认
+        skip_preview = self._sql_preview_callback and reasons and self._confirm_callback
+        if not skip_preview:
+            if self._sql_preview_callback:
+                await self._sql_preview_callback(
+                    sql=sql, cluster=cluster,
+                    risk_level=risk_level, risk_reasons=reasons,
+                )
+            else:
+                print(f"  SQL ({cluster}): {sql}")
+                if reasons:
+                    print(f"  Risk [{risk_level}]:")
+                    for reason in reasons:
+                        print(f"    - {reason}")
 
-        if has_confirm_with_risk:
+        # 高风险确认
+        if reasons and self._confirm_callback:
             confirmed = await self._confirm_callback(
                 sql=sql, cluster=cluster,
                 risk_level=risk_level, risk_reasons=reasons,

@@ -20,7 +20,6 @@ from src.feishu_session import FeishuSessionManager
 from src.feishu_message import (
     build_query_card, build_error_card, build_command_card,
     build_sql_preview_card, build_risk_confirm_card,
-    build_thinking_card,
 )
 
 # 飞书签名相关 header，encrypt_key 未配置时需移除以绕过 SDK 签名校验
@@ -234,6 +233,25 @@ class FeishuBotService:
 
     # ── 查询处理 ──
 
+    async def _add_reaction(self, message_id: str, emoji: str = "THINK") -> None:
+        """给消息添加表情反馈。表情添加失败时静默忽略（可能缺少 im:reaction 权限）。"""
+        if not message_id:
+            return
+        try:
+            request = CreateMessageReactionRequestBuilder() \
+                .message_id(message_id) \
+                .request_body(CreateMessageReactionRequestBodyBuilder() \
+                    .reaction_type(EmojiBuilder().emoji_type(emoji).build()) \
+                    .build()) \
+                .build()
+            response = await asyncio.to_thread(
+                self._client.im.v1.message_reaction.create, request
+            )
+            if not response.success():
+                logger.debug("添加表情失败: code=%s msg=%s", response.code, response.msg)
+        except Exception as e:
+            logger.debug("添加表情异常: %s", e)
+
     async def _process_query(
         self, user_id: str, chat_id: str, text: str, message_id: str = ""
     ) -> None:
@@ -241,10 +259,8 @@ class FeishuBotService:
         lock = self._session_manager.get_lock(user_id)
         async with lock:
             try:
-                # 即时反馈：发送"正在查询"提示卡片
-                await self._send_card_message(
-                    chat_id, build_thinking_card(), message_id=message_id
-                )
+                # 即时反馈：给用户消息添加表情
+                await self._add_reaction(message_id)
 
                 # Slash 命令
                 if text.startswith("/"):
