@@ -24,7 +24,10 @@ class ConversationState:
         self.pinned_messages.append({"role": "user", "content": f"[置顶] {content}"})
 
     def trim_history(self) -> None:
-        """修剪历史并保留最近几轮完整上下文。"""
+        """修剪历史并保留最近几轮完整上下文。
+
+        确保截断后不会出现孤立的 tool 消息（没有对应 assistant tool_calls）。
+        """
         recent_count = RECENT_TURNS_KEEP * 2
 
         if len(self.history) <= recent_count:
@@ -34,6 +37,7 @@ class ConversationState:
         max_total = (RECENT_TURNS_KEEP + MAX_COMPRESSED_TURNS) * 2
         if len(self.history) > max_total:
             self.history = self.history[-max_total:]
+            self._repair_orphaned_tool_messages()
 
         if len(self.history) <= recent_count:
             self._prepend_pinned()
@@ -50,8 +54,6 @@ class ConversationState:
             if role == "assistant":
                 text = self.extract_text_from_content(content)
                 if text:
-                    # 保留更多内容：SQL 查询结果通常较长，截取前 500 字符
-                    # 优先保留第一行（通常是结论/摘要）
                     first_line = text.split("\n", 1)[0]
                     if len(first_line) > 500:
                         summary = first_line[:500] + "..."
@@ -64,6 +66,7 @@ class ConversationState:
                 compressed.append({"role": "user", "content": content})
 
         self.history = compressed + recent
+        self._repair_orphaned_tool_messages()
         self._prepend_pinned()
 
     def _prepend_pinned(self) -> None:
@@ -75,6 +78,35 @@ class ConversationState:
             if not (isinstance(m.get("content"), str) and m["content"].startswith("[置顶] "))
         ]
         self.history = self.pinned_messages + self.history
+
+    def _repair_orphaned_tool_messages(self) -> None:
+        """修复孤立的 tool 消息：删除没有对应 assistant(tool_calls) 的 tool 消息。
+
+        截断/压缩历史后可能出现 tool 消息前没有 assistant 消息包含 tool_calls，
+        导致 OpenAI API 报 "Messages with role 'tool' must be a response to a
+        preceding message with 'tool_calls'"。
+        """
+        cleaned = []
+        prev_has_tool_calls = False
+
+        for msg in self.history:
+            role = msg.get("role")
+            if role == "tool":
+                if prev_has_tool_calls:
+                    cleaned.append(msg)
+                    # tool 消息后不再有 tool_calls（下一个 assistant 消息才有）
+                    prev_has_tool_calls = False
+                else:
+                    # 孤立的 tool 消息，删除
+                    continue
+            else:
+                cleaned.append(msg)
+                if role == "assistant" and msg.get("tool_calls"):
+                    prev_has_tool_calls = True
+                else:
+                    prev_has_tool_calls = False
+
+        self.history = cleaned
 
     @staticmethod
     def extract_text_from_content(content) -> str:

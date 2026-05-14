@@ -165,7 +165,7 @@ class FeishuBotService:
             try:
                 raw_req = lark.RawRequest()
                 raw_req.uri = str(request.url)
-                raw_req.headers = headers
+                raw_req.headers = request.headers
                 raw_req.body = bytes(body)
 
                 raw_resp = self._card_handler.do(raw_req)
