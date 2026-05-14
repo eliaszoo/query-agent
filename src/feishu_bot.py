@@ -176,7 +176,7 @@ class FeishuBotService:
 
                     # 返回更新后的卡片（去掉按钮，显示操作结果）
                     status_text = "✅ 已继续执行" if approved else "❌ 已取消"
-                    updated_card = json.dumps({
+                    updated_card = {
                         "config": {"wide_screen_mode": True},
                         "header": {
                             "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
@@ -185,8 +185,13 @@ class FeishuBotService:
                         "elements": [
                             {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
                         ],
-                    }, ensure_ascii=False)
-                    return Response(content=updated_card, media_type="application/json")
+                    }
+                    response_data = {
+                        "toast": {"type": "success" if approved else "info", "content": status_text},
+                        "card": updated_card,
+                    }
+                    return Response(content=json.dumps(response_data, ensure_ascii=False),
+                                   media_type="application/json")
 
                 return Response(
                     content=json.dumps({"msg": "success"}),
