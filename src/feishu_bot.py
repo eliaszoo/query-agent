@@ -82,15 +82,19 @@ class FeishuBotService:
         # 高风险 SQL 确认：confirm_id → Future
         self._pending_confirms: dict[str, asyncio.Future] = {}
 
-        # 事件处理器（含卡片交互回调）
+        # 事件处理器（仅用于消息事件）
         self._event_handler = lark.EventDispatcherHandler.builder(
             feishu_cfg.encrypt_key or "",
             feishu_cfg.verification_token or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_receive
-        ).register_p2_card_action_trigger(
-            self._on_card_action
         ).build()
+
+        # 卡片交互处理器（独立路由）
+        self._card_handler = lark.CardActionHandler.builder(
+            feishu_cfg.encrypt_key or "",
+            feishu_cfg.verification_token or "",
+        ).register(self._on_card_action).build()
 
         # FastAPI app
         self._app = FastAPI(title="query-agent-feishu-bot")
@@ -136,6 +140,30 @@ class FeishuBotService:
                 "pending_confirms": len(self._pending_confirms),
             }
 
+        @self._app.post("/webhook/card")
+        async def handle_card_action(request: Request):
+            headers = request.headers
+            body = await request.body()
+
+            try:
+                raw_req = lark.RawRequest()
+                raw_req.uri = str(request.url)
+                raw_req.body = bytes(body)
+                if not self._encrypt_key_configured:
+                    raw_req.headers = _strip_lark_sign_headers(headers)
+                else:
+                    raw_req.headers = headers
+
+                raw_resp = self._card_handler.do(raw_req)
+                return Response(
+                    content=raw_resp.content,
+                    status_code=raw_resp.status_code,
+                    media_type="application/json",
+                )
+            except Exception as e:
+                logger.error("处理卡片交互失败: %s", e, exc_info=True)
+                return Response(status_code=500)
+
     # ── 事件回调 ──
 
     def _on_message_receive(self, event: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -173,11 +201,11 @@ class FeishuBotService:
         except Exception as e:
             logger.error("处理消息事件失败: %s", e, exc_info=True)
 
-    def _on_card_action(self, event) -> None:
+    def _on_card_action(self, card: lark.Card) -> None:
         """处理卡片交互按钮回调（高风险确认）。"""
         try:
-            action = event.event.action
-            value = action.value or {}
+            action = card.action
+            value = (action.value or {}) if action else {}
             confirm_id = value.get("confirm_id", "")
             approved = value.get("approved", False)
 
@@ -205,6 +233,23 @@ class FeishuBotService:
 
     # ── 查询处理 ──
 
+    async def _add_reaction(self, message_id: str, emoji: str = "👀") -> None:
+        """给消息添加表情反馈。"""
+        if not message_id:
+            return
+        try:
+            request = CreateMessageReactionRequestBuilder() \
+                .message_id(message_id) \
+                .request_body(CreateMessageReactionRequestBodyBuilder() \
+                    .reaction_type(EmojiBuilder().emoji_type(emoji).build()) \
+                    .build()) \
+                .build()
+            response = self._client.im.v1.message_reaction.create(request)
+            if not response.success():
+                logger.warning("添加表情失败: code=%s msg=%s", response.code, response.msg)
+        except Exception as e:
+            logger.debug("添加表情异常: %s", e)
+
     async def _process_query(
         self, user_id: str, chat_id: str, text: str, message_id: str = ""
     ) -> None:
@@ -212,6 +257,9 @@ class FeishuBotService:
         lock = self._session_manager.get_lock(user_id)
         async with lock:
             try:
+                # 即时反馈：给用户消息加表情
+                await self._add_reaction(message_id, "👀")
+
                 # Slash 命令
                 if text.startswith("/"):
                     card_content = await self._handle_slash_command(text, user_id)
