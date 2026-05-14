@@ -174,21 +174,17 @@ class FeishuBotService:
                     else:
                         logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
 
-                    # 返回更新后的卡片（去掉按钮，显示操作结果）
-                    status_text = "✅ 已继续执行" if approved else "❌ 已取消"
-                    updated_card = {
-                        "config": {"wide_screen_mode": True},
-                        "header": {
-                            "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
-                            "template": "green" if approved else "grey",
-                        },
-                        "elements": [
-                            {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
-                        ],
-                    }
+                    # 通过 PATCH API 更新卡片内容（去掉按钮，显示操作结果）
+                    card_message_id = data.get("open_message_id", "")
+                    if card_message_id:
+                        asyncio.create_task(
+                            self._update_confirm_card(card_message_id, approved)
+                        )
+
+                    # 返回 toast 提示
+                    status_text = "已继续执行" if approved else "已取消"
                     response_data = {
                         "toast": {"type": "success" if approved else "info", "content": status_text},
-                        "card": updated_card,
                     }
                     return Response(content=json.dumps(response_data, ensure_ascii=False),
                                    media_type="application/json")
@@ -361,6 +357,35 @@ class FeishuBotService:
         return _feishu_confirm
 
     # ── 消息发送 ──
+
+    async def _update_confirm_card(self, message_id: str, approved: bool) -> None:
+        """用 PATCH API 更新确认卡片，去掉按钮，显示操作结果。"""
+        try:
+            status_text = "✅ 已继续执行" if approved else "❌ 已取消"
+            updated_card = json.dumps({
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
+                    "template": "green" if approved else "grey",
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
+                ],
+            }, ensure_ascii=False)
+
+            request = PatchMessageRequestBuilder() \
+                .message_id(message_id) \
+                .request_body(PatchMessageRequestBodyBuilder()
+                    .content(updated_card)
+                    .build()) \
+                .build()
+            response = await asyncio.to_thread(
+                self._client.im.v1.message.patch, request
+            )
+            if not response.success():
+                logger.warning("更新确认卡片失败: code=%s msg=%s", response.code, response.msg)
+        except Exception as e:
+            logger.debug("更新确认卡片异常: %s", e)
 
     async def _send_card_message(
         self, chat_id: str, card_content: str, message_id: str = ""
