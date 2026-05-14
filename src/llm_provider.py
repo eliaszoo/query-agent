@@ -286,12 +286,17 @@ class OpenAICompatibleProvider(LLMProvider):
 
     def build_assistant_message(self, raw_content):
         # raw_content 是 OpenAI 的 ChatCompletionMessage 对象
-        return {"role": "assistant", "content": raw_content.content,
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in (raw_content.tool_calls or [])
-                ] if raw_content.tool_calls else None}
+        msg = {"role": "assistant", "content": raw_content.content}
+        # thinking mode 模型（如 DeepSeek）要求回传 reasoning_content
+        if getattr(raw_content, "reasoning_content", None):
+            msg["reasoning_content"] = raw_content.reasoning_content
+        if raw_content.tool_calls:
+            msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in raw_content.tool_calls
+            ]
+        return msg
 
 
 def create_provider(

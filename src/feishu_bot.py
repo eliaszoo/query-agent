@@ -179,10 +179,21 @@ class FeishuBotService:
             logger.info("收到飞书消息: user=%s chat=%s text=%s", user_id, chat_id, text[:100])
 
             # 异步处理查询，不阻塞事件回调
-            asyncio.create_task(self._process_query(user_id, chat_id, text))
+            task = asyncio.create_task(self._process_query(user_id, chat_id, text))
+            task.add_done_callback(self._on_task_done)
 
         except Exception as e:
             logger.error("处理消息事件失败: %s", e, exc_info=True)
+
+    @staticmethod
+    def _on_task_done(task: asyncio.Task) -> None:
+        """异步任务完成回调，记录未捕获的异常。"""
+        if task.cancelled():
+            logger.warning("查询任务被取消")
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("查询任务未捕获异常: %s", exc, exc_info=exc)
 
     async def _process_query(self, user_id: str, chat_id: str, text: str) -> None:
         """异步处理用户查询并发送回复。
