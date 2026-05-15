@@ -79,8 +79,8 @@ class FeishuBotService:
         # encrypt_key 是否已配置
         self._encrypt_key_configured = bool(feishu_cfg.encrypt_key)
 
-        # 高风险 SQL 确认：confirm_id → Future
-        self._pending_confirms: dict[str, asyncio.Future] = {}
+        # 高风险 SQL 确认：confirm_id → (Future, card_info)
+        self._pending_confirms: dict[str, tuple[asyncio.Future, dict]] = {}
 
         # 事件处理器（仅用于消息事件）
         self._event_handler = lark.EventDispatcherHandler.builder(
@@ -167,22 +167,23 @@ class FeishuBotService:
                 approved = value.get("approved", False)
 
                 if confirm_id:
-                    future = self._pending_confirms.pop(confirm_id, None)
+                    entry = self._pending_confirms.pop(confirm_id, None)
+                    future = entry[0] if entry else None
+                    card_info = entry[1] if entry else {}
                     if future and not future.done():
                         future.set_result(approved)
                         logger.info("卡片按钮回调: confirm_id=%s approved=%s", confirm_id, approved)
                     else:
                         logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
 
-                    # 通过 PATCH API 更新卡片内容（去掉按钮，显示操作结果）
-                    # open_message_id 在 event.context 中
+                    # 通过 PATCH API 更新卡片内容（保留 SQL 预览，去掉按钮）
                     event_data = data.get("event", {})
                     context = event_data.get("context", {}) if isinstance(event_data, dict) else {}
                     card_message_id = context.get("open_message_id", "")
                     print(f"[CARD-CALLBACK] open_message_id={card_message_id} approved={approved}")
                     if card_message_id:
                         asyncio.create_task(
-                            self._update_confirm_card(card_message_id, approved)
+                            self._update_confirm_card(card_message_id, approved, card_info)
                         )
 
                     # 返回 toast 提示
@@ -341,7 +342,8 @@ class FeishuBotService:
             confirm_id = f"{user_id}:{uuid4().hex[:8]}"
             loop = asyncio.get_running_loop()
             future = loop.create_future()
-            self._pending_confirms[confirm_id] = future
+            card_info = {"sql": sql, "cluster": cluster, "risk_level": risk_level, "risk_reasons": risk_reasons}
+            self._pending_confirms[confirm_id] = (future, card_info)
 
             # 发送确认卡片
             card = build_risk_confirm_card(
@@ -362,19 +364,48 @@ class FeishuBotService:
 
     # ── 消息发送 ──
 
-    async def _update_confirm_card(self, message_id: str, approved: bool) -> None:
-        """用 PATCH API 更新确认卡片，去掉按钮，显示操作结果。"""
+    async def _update_confirm_card(self, message_id: str, approved: bool, card_info: dict) -> None:
+        """用 PATCH API 更新确认卡片，保留 SQL 预览，去掉按钮，加状态标识。"""
         try:
             status_text = "✅ 已继续执行" if approved else "❌ 已取消"
+            sql = card_info.get("sql", "")
+            cluster = card_info.get("cluster", "")
+            risk_level = card_info.get("risk_level", "")
+            risk_reasons = card_info.get("risk_reasons", [])
+
+            elements = []
+
+            # 状态标识
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": status_text}})
+
+            # SQL 预览（保留）
+            sql_display = sql[:2000]
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**集群**: {cluster or '默认'}\n```sql\n{sql_display}\n```",
+                },
+            })
+
+            # 风险提示（保留）
+            if risk_reasons:
+                risk_lines = "\n".join(f"- {r}" for r in risk_reasons)
+                elements.append({
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**风险 [{risk_level}]**:\n{risk_lines}",
+                    },
+                })
+
             updated_card = json.dumps({
                 "config": {"wide_screen_mode": True},
                 "header": {
                     "title": {"tag": "plain_text", "content": "高风险 SQL 确认"},
                     "template": "green" if approved else "grey",
                 },
-                "elements": [
-                    {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
-                ],
+                "elements": elements,
             }, ensure_ascii=False)
 
             request = PatchMessageRequestBuilder() \
