@@ -175,8 +175,10 @@ class FeishuBotService:
                         logger.warning("未找到或已完成的确认: confirm_id=%s", confirm_id)
 
                     # 通过 PATCH API 更新卡片内容（去掉按钮，显示操作结果）
-                    # open_message_id 在 event 顶层
-                    card_message_id = data.get("open_message_id", "") or data.get("event", {}).get("open_message_id", "")
+                    # open_message_id 在 event.context 中
+                    event_data = data.get("event", {})
+                    context = event_data.get("context", {}) if isinstance(event_data, dict) else {}
+                    card_message_id = context.get("open_message_id", "")
                     print(f"[CARD-CALLBACK] open_message_id={card_message_id} approved={approved}")
                     if card_message_id:
                         asyncio.create_task(
