@@ -290,16 +290,27 @@ class FeishuBotService:
 
                 agent = self._session_manager.get_agent(user_id)
 
-                # 反馈检测：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
+                # 反馈检测：显式反馈（"记住"/"默认"等）不需要上次查询上下文
+                explicit_lesson = agent.extract_explicit_feedback_lesson(text)
+                if explicit_lesson:
+                    business = agent.get_last_business() or ""
+                    session = self._session_manager.get_session(user_id)
+                    agent.record_feedback(
+                        (session.last_query if session else "") or text,
+                        business, text, explicit_lesson
+                    )
+                    card = build_command_card("已记住", f"{explicit_lesson}")
+                    await self._send_card_message(chat_id, card, message_id=message_id)
+                    return
+
+                # 需要上下文的 LLM 反馈检测（如"不对"/"错了"等隐式纠正）
                 session = self._session_manager.get_session(user_id)
                 if session and session.last_query and self._likely_feedback(text):
-                    feedback_lesson = agent.extract_explicit_feedback_lesson(text)
-                    if feedback_lesson is None:
-                        feedback_lesson = await agent.extract_feedback_lesson(
-                            original_query=session.last_query,
-                            agent_response=session.last_response,
-                            user_feedback=text,
-                        )
+                    feedback_lesson = await agent.extract_feedback_lesson(
+                        original_query=session.last_query,
+                        agent_response=session.last_response,
+                        user_feedback=text,
+                    )
                     if feedback_lesson:
                         business = agent.get_last_business()
                         agent.record_feedback(session.last_query, business, text, feedback_lesson)
@@ -650,7 +661,7 @@ class FeishuBotService:
         return build_command_card("Field Knowledge", f"Not found: {table}.{column}")
 
     def _cmd_rules(self, agent) -> str:
-        rules = agent.list_preference_rules()
+        rules = agent.list_preference_rules(business="__all__")
         if not rules:
             return build_command_card("Default Rules", "No default query rules.")
 

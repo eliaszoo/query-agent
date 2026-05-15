@@ -784,9 +784,21 @@ class QueryAgent:
     def list_preference_rules(self, business: str = ""):
         """列出默认查询规则。
 
-        business 非空时：返回通用规则 + 该业务的规则。
+        business 非空时（非 "__all__"）：返回通用规则 + 该业务的规则。
+        business 为 "__all__" 时：返回所有业务的所有规则。
         business 为空时：只返回通用规则（entry.business 为空的条目），不聚合其他业务的规则。
         """
+        if business == "__all__":
+            # 返回所有规则
+            result = []
+            seen = set()
+            for mgr in self._preference_rules_managers.values():
+                for r in mgr.get_rules(business=""):
+                    key = (r.business, r.rule, r.rule_type)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(r)
+            return result
         if business:
             return self._get_preference_rules_manager(business).get_rules(business)
         # 无业务上下文时只返回通用规则

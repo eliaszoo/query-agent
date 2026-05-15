@@ -429,9 +429,14 @@ def _handle_clear(agent: QueryAgent, args: list[str]) -> None:
         print(f"  {_GREEN}Cleared{_RESET} all error memory")
 
 
-def _handle_rules(agent: QueryAgent) -> None:
+def _handle_rules(agent: QueryAgent, args: list[str]) -> None:
     """处理 /rules 命令。"""
-    rules = agent.list_preference_rules()
+    if args:
+        rules = agent.list_preference_rules(args[0])
+    else:
+        # 无业务参数时显示所有规则
+        rules = agent.list_preference_rules(business="__all__")
+
     if not rules:
         print(f"  {_DIM}No default query rules.{_RESET}")
         return
@@ -583,7 +588,7 @@ async def main(config_path: str = "./config.yaml") -> None:
             continue
 
         if cmd == "/rules":
-            _handle_rules(agent)
+            _handle_rules(agent, parts[1:])
             continue
 
         if cmd == "/rules_clear":
@@ -706,20 +711,26 @@ async def main(config_path: str = "./config.yaml") -> None:
                 print(f"  {_YELLOW}Unknown command:{_RESET} {cmd}  {_DIM}(Type Tab for available commands){_RESET}")
             continue
 
-        # 检测用户反馈：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
-        # 反馈只记录经验，不触发查询
+        # 检测用户反馈：显式反馈（"记住"/"默认"等）不需要上次查询上下文
+        # 先尝试结构化/显式提取（零 LLM 开销）
+        explicit_lesson = agent.extract_explicit_feedback_lesson(user_input)
+        if explicit_lesson:
+            business = agent.get_last_business() or ""
+            agent.record_feedback(last_query or user_input, business, user_input, explicit_lesson)
+            print(f"  {_YELLOW}Saved lesson:{_RESET} {explicit_lesson}")
+            continue
+
+        # 需要上下文的 LLM 反馈检测（如"不对"/"错了"等隐式纠正）
         if last_query and last_response and _likely_feedback(user_input):
-            feedback_lesson = agent.extract_explicit_feedback_lesson(user_input)
-            if feedback_lesson is None:
-                spinner = Spinner("Analyzing feedback")
-                _active_spinner = spinner
-                with spinner:
-                    feedback_lesson = await agent.extract_feedback_lesson(
-                        original_query=last_query,
-                        agent_response=last_response,
-                        user_feedback=user_input,
-                    )
-                _active_spinner = None
+            spinner = Spinner("Analyzing feedback")
+            _active_spinner = spinner
+            with spinner:
+                feedback_lesson = await agent.extract_feedback_lesson(
+                    original_query=last_query,
+                    agent_response=last_response,
+                    user_feedback=user_input,
+                )
+            _active_spinner = spinner = None
             if feedback_lesson:
                 business = agent.get_last_business()
                 agent.record_feedback(last_query, business, user_input, feedback_lesson)
