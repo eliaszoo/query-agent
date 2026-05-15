@@ -1,6 +1,7 @@
 """业务选择服务。"""
 
 import logging
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,12 @@ class BusinessSelectionService:
             if entry.knowledge:
                 if entry.knowledge.description:
                     candidates.add(entry.knowledge.description.lower())
+                    # 将 description 按分隔符拆分为关键词，用于反向匹配
+                    # 如 "多供应商（酷狗/网易云/TME/音集协）" → 提取 "音集协" 等
+                    for kw in re.split(r'[，,、；;（(）)\s：:]+', entry.knowledge.description):
+                        kw = kw.strip().lower()
+                        if len(kw) >= 2:
+                            candidates.add(kw)
                 # 匹配 term_mappings 中的关键词（如 "形象/数字人" → 拆分匹配 "形象" 和 "数字人"）
                 for term in (entry.knowledge.term_mappings or {}):
                     for word in term.split("/"):
