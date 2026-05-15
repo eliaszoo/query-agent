@@ -785,11 +785,12 @@ class QueryAgent:
         """列出默认查询规则。
 
         business 非空时（非 "__all__"）：返回通用规则 + 该业务的规则。
-        business 为 "__all__" 时：返回所有业务的所有规则。
+        business 为 "__all__" 时：返回所有业务的所有规则（扫描磁盘目录）。
         business 为空时：只返回通用规则（entry.business 为空的条目），不聚合其他业务的规则。
         """
         if business == "__all__":
-            # 返回所有规则
+            # 扫描 .query-agent/ 下所有子目录，确保所有业务的 manager 已初始化
+            self._discover_business_storage()
             result = []
             seen = set()
             for mgr in self._preference_rules_managers.values():
@@ -806,6 +807,24 @@ class QueryAgent:
         for mgr in self._preference_rules_managers.values():
             result.extend(r for r in mgr.get_rules(business="") if not r.business)
         return result
+
+    def _discover_business_storage(self) -> None:
+        """扫描 .query-agent/ 目录，为所有已有存储的业务初始化 manager。"""
+        base = ".query-agent"
+        if not os.path.isdir(base):
+            return
+        for dirname in os.listdir(base):
+            dirpath = os.path.join(base, dirname)
+            if not os.path.isdir(dirpath):
+                continue
+            # 跳过特殊目录
+            if dirname.startswith("config-") or dirname == "_shared":
+                continue
+            # 如果该目录下有持久化文件，确保 manager 已初始化
+            if any(os.path.exists(os.path.join(dirpath, f)) for f in (
+                "preference_rules.json", "error_memory.json", "field_knowledge.json",
+            )):
+                self._ensure_business_storage(dirname)
 
     def clear_preference_rules(self, business: str = "") -> None:
         """清空默认查询规则并失效 prompt 缓存。"""
