@@ -176,6 +176,7 @@ class FeishuBotService:
 
                     # 通过 PATCH API 更新卡片内容（去掉按钮，显示操作结果）
                     card_message_id = data.get("open_message_id", "")
+                    print(f"[CARD-CALLBACK] open_message_id={card_message_id} approved={approved}")
                     if card_message_id:
                         asyncio.create_task(
                             self._update_confirm_card(card_message_id, approved)
@@ -382,8 +383,7 @@ class FeishuBotService:
             response = await asyncio.to_thread(
                 self._client.im.v1.message.patch, request
             )
-            if not response.success():
-                logger.warning("更新确认卡片失败: code=%s msg=%s", response.code, response.msg)
+            print(f"[PATCH-CARD] msg_id={message_id} success={response.success()} code={response.code} msg={response.msg}")
         except Exception as e:
             logger.debug("更新确认卡片异常: %s", e)
 
