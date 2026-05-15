@@ -140,7 +140,7 @@ class FeishuBotService:
 
             try:
                 data = json.loads(body)
-                print(f"[CARD-CALLBACK] keys={list(data.keys())} header_keys={list(data.get('header', {}).keys()) if isinstance(data.get('header'), dict) else 'N/A'} event_keys={list(data.get('event', {}).keys()) if isinstance(data.get('event'), dict) else 'N/A'}")
+                print(f"[CARD-CALLBACK] keys={list(data.keys())} event_keys={list(data.get('event', {}).keys()) if isinstance(data.get('event'), dict) else 'N/A'} context={json.dumps(data.get('event', {}).get('context', {}), ensure_ascii=False)[:200]} operator={json.dumps(data.get('event', {}).get('operator', {}), ensure_ascii=False)[:200]}")
 
                 # URL verification (challenge)
                 if data.get("type") == "url_verification":
