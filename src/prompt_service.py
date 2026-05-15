@@ -108,6 +108,11 @@ class PromptService:
         if is_stdio_mode and configured_business_knowledge.description:
             knowledge_map["default"] = configured_business_knowledge
 
+        # 已识别具体业务时，只注入该业务的领域知识（减少 token 和干扰）
+        # 业务概览仍列出所有业务，供 LLM 路由
+        if current_business and current_business in knowledge_map:
+            knowledge_map = {current_business: knowledge_map[current_business]}
+
         prompt = build_system_prompt(businesses, knowledge_map)
 
         field_prompt = field_knowledge_manager.build_field_prompt(current_business)

@@ -613,6 +613,7 @@ async def main(config_path: str = "./config.yaml") -> None:
 
         if cmd == "/new":
             agent.clear_history()
+            agent.clear_locked_business()
             last_query = ""
             last_response = ""
             print(f"  {_GREEN}Started new conversation.{_RESET}")

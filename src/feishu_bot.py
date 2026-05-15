@@ -504,6 +504,8 @@ class FeishuBotService:
         args = parts[1:]
         agent = self._session_manager.get_agent(user_id)
 
+        if cmd == "/help":
+            return self._cmd_help()
         if cmd == "/list":
             return await self._cmd_list(agent)
         if cmd == "/memory":
@@ -512,7 +514,8 @@ class FeishuBotService:
             return self._cmd_clear(agent, args)
         if cmd == "/new":
             agent.clear_history()
-            return build_command_card("新会话", "已开始新的对话。")
+            agent.clear_locked_business()
+            return build_command_card("新会话", "已开始新的对话，业务锁定已解除。")
         if cmd == "/business":
             return self._cmd_business(agent, args)
         if cmd == "/fields":
@@ -568,6 +571,28 @@ class FeishuBotService:
             lines.append("No MCP Servers configured. Use /add to add one.")
 
         return build_command_card("MCP Servers & Businesses", "\n".join(lines))
+
+    @staticmethod
+    def _cmd_help() -> str:
+        lines = [
+            "**/help** — 显示所有命令",
+            "**/new** — 开始新对话（解除业务锁定）",
+            "**/list** — 列出 MCP Servers 与业务",
+            "**/business** current|set <name>|clear — 查看/锁定/解锁业务",
+            "**/add** <name> <sse_url> [key] — 添加 MCP Server",
+            "**/remove** <name> — 移除 MCP Server",
+            "**/memory** — 查看错误记忆",
+            "**/clear** [business] — 清除错误记忆",
+            "**/fields** — 列出所有字段知识",
+            "**/field** <table>.<col> <desc> — 添加字段知识",
+            "**/field_rm** <table>.<col> — 删除字段知识",
+            "**/remember** <rule> — 保存默认查询规则",
+            "**/rules** — 列出默认查询规则",
+            "**/rules_clear** [business] — 清除默认查询规则",
+            "**/prompt** — 查看当前 system prompt",
+            "**/plan** <query> — 预览查询计划",
+        ]
+        return build_command_card("可用命令", "\n".join(lines))
 
     def _cmd_memory(self, agent) -> str:
         entries = [e for e in agent.get_error_memory_entries() if e.error_type != "USER_FEEDBACK"]
