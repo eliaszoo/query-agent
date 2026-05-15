@@ -140,7 +140,6 @@ class FeishuBotService:
 
             try:
                 data = json.loads(body)
-                print(f"[CARD-CALLBACK] keys={list(data.keys())} event_keys={list(data.get('event', {}).keys()) if isinstance(data.get('event'), dict) else 'N/A'} context={json.dumps(data.get('event', {}).get('context', {}), ensure_ascii=False)[:200]} operator={json.dumps(data.get('event', {}).get('operator', {}), ensure_ascii=False)[:200]}")
 
                 # URL verification (challenge)
                 if data.get("type") == "url_verification":
@@ -151,7 +150,6 @@ class FeishuBotService:
 
                 # 加密 body
                 if "encrypt" in data and not data.get("action") and not data.get("event"):
-                    print("[CARD-CALLBACK] body encrypted, cannot decrypt")
                     return Response(status_code=200)
 
                 # 卡片交互回调：可能是事件格式 (schema/header/event) 或直接格式 (action)
@@ -162,7 +160,6 @@ class FeishuBotService:
                     action = data.get("action", {})
 
                 value = action.get("value", {}) if isinstance(action, dict) else {}
-                print(f"[CARD-CALLBACK] action={json.dumps(action, ensure_ascii=False)[:300]} value={json.dumps(value, ensure_ascii=False)[:200]}")
                 confirm_id = value.get("confirm_id", "")
                 approved = value.get("approved", False)
 
@@ -180,7 +177,6 @@ class FeishuBotService:
                     event_data = data.get("event", {})
                     context = event_data.get("context", {}) if isinstance(event_data, dict) else {}
                     card_message_id = context.get("open_message_id", "")
-                    print(f"[CARD-CALLBACK] open_message_id={card_message_id} approved={approved}")
                     if card_message_id:
                         asyncio.create_task(
                             self._update_confirm_card(card_message_id, approved, card_info)
@@ -417,7 +413,6 @@ class FeishuBotService:
             response = await asyncio.to_thread(
                 self._client.im.v1.message.patch, request
             )
-            print(f"[PATCH-CARD] msg_id={message_id} success={response.success()} code={response.code} msg={response.msg}")
         except Exception as e:
             logger.debug("更新确认卡片异常: %s", e)
 
