@@ -154,10 +154,12 @@ class TestSQLRiskChecker:
         assert result.has_risk
         assert result.risk_level == "high"
 
-    def test_no_index_info_with_where_no_risk(self):
-        """没有索引信息但有 WHERE → 无法判断，不报索引风险。"""
+    def test_no_index_info_with_where_reports_medium(self):
+        """没有索引信息但有 WHERE → 无法验证索引覆盖，报 medium 风险。"""
         result = self.checker.check("default", "test", "SELECT id FROM tb_scene WHERE id = 1")
-        assert not result.has_risk
+        assert result.has_risk
+        assert result.risk_level == "medium"
+        assert "无法验证索引覆盖" in result.risk_reasons[0]
 
     # --- 空输入 ---
 

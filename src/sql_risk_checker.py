@@ -88,14 +88,25 @@ class SQLRiskChecker:
         # 1. 逐表检查索引覆盖
         for table in tables:
             indexes = self._index_cache.get((business, cluster, table))
-            if indexes is None:
-                # 没有索引信息，跳过索引分析
-                continue
-
             table_where_cols = {
                 col for col in where_columns
                 if not col.startswith(("func:", "expr:"))
             }
+
+            if indexes is None:
+                # 没有索引信息，无法验证索引覆盖
+                if table_where_cols:
+                    reasons.append(
+                        f"表 {table}: 无法验证索引覆盖，WHERE 条件可能无法高效使用索引"
+                    )
+                    if not risk_level:
+                        risk_level = "medium"
+                elif not has_limit:
+                    reasons.append(
+                        f"表 {table}: 无 WHERE 条件且无 LIMIT，可能返回大量数据（全表扫描）"
+                    )
+                    risk_level = "high"
+                continue
 
             if not table_where_cols:
                 # 无 WHERE 条件且无 LIMIT → 全表扫描

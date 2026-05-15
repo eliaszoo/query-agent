@@ -771,7 +771,8 @@ agent:
         )
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
-            agent = QueryAgent(config_path=str(config_file), confirm_callback=lambda _: True)
+            async def _confirm(**_): return True
+            agent = QueryAgent(config_path=str(config_file), confirm_callback=_confirm)
 
         # Mock Anthropic response: direct text, no tool use
         from src.llm_provider import LLMResponse
@@ -815,7 +816,8 @@ agent:
         )
 
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
-            agent = QueryAgent(config_path=str(config_file), confirm_callback=lambda _: True)
+            async def _confirm(**_): return True
+            agent = QueryAgent(config_path=str(config_file), confirm_callback=_confirm)
 
         from src.llm_provider import LLMResponse, ToolCall
 
