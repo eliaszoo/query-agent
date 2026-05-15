@@ -1237,6 +1237,7 @@ class QueryAgent:
             )
 
             tool_results = []
+            user_cancelled = False
             for tc in (response.tool_calls or []):
                 metrics.tool_calls += 1
 
@@ -1269,6 +1270,7 @@ class QueryAgent:
                                     json.dumps({"success": False, "error_message": "前置工具已取消"}, ensure_ascii=False),
                                 )
                             )
+                    user_cancelled = True
                     break
                 else:
                     result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)
@@ -1314,6 +1316,13 @@ class QueryAgent:
                 messages.append({"role": "user", "content": tool_results})
             else:
                 messages.extend(tool_results)
+
+            # 用户取消后直接返回，不让 LLM 继续重试
+            if user_cancelled:
+                cancel_msg = "查询已被用户取消。"
+                messages.append({"role": "assistant", "content": cancel_msg})
+                self._conversation.history = messages
+                return cancel_msg
 
     async def _multi_business_conversation_loop(
         self,
