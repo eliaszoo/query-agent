@@ -22,6 +22,12 @@ from src.feishu_message import (
     build_sql_preview_card, build_risk_confirm_card,
 )
 
+# 反馈检测关键词（与 main.py _FEEDBACK_KEYWORDS 保持一致）
+_FEEDBACK_KEYWORDS = {
+    "不对", "错了", "不是", "应该", "缺少", "遗漏", "多了", "少了", "不要", "不能",
+    "记住", "默认", "以后都", "后续查询", "优先过滤",
+}
+
 # 飞书签名相关 header，encrypt_key 未配置时需移除以绕过 SDK 签名校验
 _LARK_SIGN_HEADERS = {"x-lark-signature", "x-lark-request-timestamp", "x-lark-request-nonce"}
 
@@ -280,9 +286,29 @@ class FeishuBotService:
                     card_content = await self._handle_slash_command(text, user_id)
                     if card_content:
                         await self._send_card_message(chat_id, card_content, message_id=message_id)
-                        return
+                    return
 
                 agent = self._session_manager.get_agent(user_id)
+
+                # 反馈检测：如果上一轮有查询结果，判断当前输入是否是对前次结果的纠正
+                session = self._session_manager.get_session(user_id)
+                if session and session.last_query and self._likely_feedback(text):
+                    feedback_lesson = agent.extract_explicit_feedback_lesson(text)
+                    if feedback_lesson is None:
+                        feedback_lesson = await agent.extract_feedback_lesson(
+                            original_query=session.last_query,
+                            agent_response=session.last_response,
+                            user_feedback=text,
+                        )
+                    if feedback_lesson:
+                        business = agent.get_last_business()
+                        agent.record_feedback(session.last_query, business, text, feedback_lesson)
+                        card = build_command_card("已记住", f"{feedback_lesson}")
+                        await self._send_card_message(chat_id, card, message_id=message_id)
+                    else:
+                        card = build_command_card("反馈", "未能提取可操作的规则，请使用 /remember 命令手动添加。")
+                        await self._send_card_message(chat_id, card, message_id=message_id)
+                    return
 
                 # 注入飞书确认回调（替换默认的 input 确认）
                 original_confirm = agent._confirm_callback
@@ -307,10 +333,20 @@ class FeishuBotService:
                 card_content = build_query_card(result, metrics, context)
                 await self._send_card_message(chat_id, card_content, message_id=message_id)
 
+                # 更新最近查询上下文（供反馈检测使用）
+                self._session_manager.update_last_query(user_id, text, result)
+
             except Exception as e:
                 logger.error("查询处理失败: user=%s error=%s", user_id, e, exc_info=True)
                 error_card = build_error_card(f"查询处理失败: {e}")
                 await self._send_card_message(chat_id, error_card, message_id=message_id)
+
+    @staticmethod
+    def _likely_feedback(text: str) -> bool:
+        """启发式判断用户输入是否可能是对前次结果的反馈。"""
+        if len(text) > 100:
+            return False
+        return any(kw in text for kw in _FEEDBACK_KEYWORDS)
 
     def _make_sql_preview_callback(self, chat_id: str, message_id: str):
         """创建 SQL 预览回调，发送预览卡片到话题。"""

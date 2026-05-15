@@ -16,6 +16,8 @@ class SessionEntry:
 
     agent: QueryAgent
     last_active: float  # 上次活动时间戳
+    last_query: str = ""  # 最近一次查询文本
+    last_response: str = ""  # 最近一次查询回复
 
 
 class FeishuSessionManager:
@@ -51,10 +53,24 @@ class FeishuSessionManager:
             return entry.agent
 
         # 创建新会话
-        agent = QueryAgent(config_path=self._config_path, confirm_callback=lambda _: True)
+        async def _confirm(**_):
+            return True
+
+        agent = QueryAgent(config_path=self._config_path, confirm_callback=_confirm)
         self._sessions[user_id] = SessionEntry(agent=agent, last_active=now)
         logger.info("为用户 %s 创建新会话，当前总会话数: %d", user_id, len(self._sessions))
         return agent
+
+    def get_session(self, user_id: str) -> SessionEntry | None:
+        """获取用户的 SessionEntry（含 last_query/last_response）。"""
+        return self._sessions.get(user_id)
+
+    def update_last_query(self, user_id: str, query: str, response: str) -> None:
+        """更新用户最近一次查询和回复。"""
+        entry = self._sessions.get(user_id)
+        if entry:
+            entry.last_query = query
+            entry.last_response = response
 
     def get_lock(self, user_id: str) -> asyncio.Lock:
         """获取用户的并发锁，防止同一用户同时发起多个查询。
