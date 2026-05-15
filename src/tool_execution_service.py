@@ -139,14 +139,27 @@ class ToolExecutionService:
         business = arguments.get("business", "") if isinstance(arguments, dict) else ""
         risk_note = arguments.get("risk_note", "") if isinstance(arguments, dict) else ""
 
-        # 风险评估
+        # 风险评估：始终运行静态检测，LLM risk_note 作为补充
+        await self.ensure_indexes_loaded()
+        risk_result = self._risk_checker.check(business or "default", cluster, sql)
+        static_risk_level = risk_result.risk_level
+        static_reasons = risk_result.risk_reasons
+
         if risk_note:
-            risk_level, reasons = self.parse_risk_note(risk_note)
+            note_risk_level, note_reasons = self.parse_risk_note(risk_note)
         else:
-            await self.ensure_indexes_loaded()
-            risk_result = self._risk_checker.check(business or "default", cluster, sql)
-            risk_level = risk_result.risk_level
-            reasons = risk_result.risk_reasons
+            note_risk_level, note_reasons = "", []
+
+        # 静态检测有索引信息时以其为准；无索引信息时用 risk_note 兜底
+        if static_reasons:
+            risk_level = static_risk_level
+            reasons = static_reasons
+        elif note_reasons:
+            risk_level = note_risk_level
+            reasons = note_reasons
+        else:
+            risk_level = ""
+            reasons = []
 
         # 发送 SQL 预览
         # 飞书模式：有风险+确认回调时跳过单独预览（确认卡片已含 SQL+风险+按钮）
