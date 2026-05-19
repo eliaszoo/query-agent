@@ -88,6 +88,9 @@ class FeishuBotService:
         # 高风险 SQL 确认：confirm_id → (Future, card_info)
         self._pending_confirms: dict[str, tuple[asyncio.Future, dict]] = {}
 
+        # 机器人 open_id（启动时从飞书 API 获取）
+        self._bot_open_id: str = ""
+
         # 事件处理器（仅用于消息事件）
         self._event_handler = lark.EventDispatcherHandler.builder(
             feishu_cfg.encrypt_key or "",
@@ -216,10 +219,34 @@ class FeishuBotService:
             chat_id = event_data.chat_id if event_data else ""
             message_type = event_data.message_type if event_data else ""
             message_id = event_data.message_id if event_data else ""
+            chat_type = event_data.chat_type if event_data else ""
 
             if message_type != "text":
                 logger.debug("忽略非文本消息: type=%s", message_type)
                 return
+
+            # 群聊中仅处理 @机器人 的消息，忽略 @所有人 和无 @ 的消息
+            if chat_type == "group":
+                mentions = event_data.mentions if event_data else None
+                if not mentions:
+                    logger.debug("群聊消息无 mention，忽略（可能是 @所有人 或无 @）")
+                    return
+
+                # 提取 mention 中的 open_id 列表
+                mentioned_open_ids = [
+                    m.id.open_id for m in mentions if m.id and m.id.open_id
+                ]
+
+                if self._bot_open_id:
+                    if self._bot_open_id not in mentioned_open_ids:
+                        logger.debug("群聊消息未 @机器人，忽略")
+                        return
+                else:
+                    # bot_open_id 未获取到，检查原始 content 是否包含 @_user_（@机器人标记）
+                    content_raw = event_data.content or "{}" if event_data else "{}"
+                    if "@_user_" not in content_raw:
+                        logger.debug("群聊消息无 @机器人 标记，忽略")
+                        return
 
             message_dict = {}
             if event_data:
@@ -793,6 +820,27 @@ class FeishuBotService:
             await asyncio.sleep(60)
             self._session_manager.cleanup_expired()
 
+    def _fetch_bot_open_id(self) -> None:
+        """启动时从飞书 API 获取机器人自身的 open_id，用于区分 @机器人 与 @所有人。"""
+        try:
+            req = lark.BaseRequest.builder() \
+                .http_method(lark.HttpMethod.GET) \
+                .uri("/open-apis/bot/v3/info/") \
+                .build()
+            resp = self._client.request(req)
+            if resp.success():
+                data = json.loads(resp.content.decode("utf-8")) if isinstance(resp.content, bytes) else {}
+                bot_info = data.get("bot", {})
+                self._bot_open_id = bot_info.get("open_id", "")
+                if self._bot_open_id:
+                    logger.info("获取机器人 open_id: %s", self._bot_open_id)
+                else:
+                    logger.warning("获取机器人 open_id 失败: 响应中无 open_id, data=%s", data)
+            else:
+                logger.warning("获取机器人 open_id 失败: code=%s msg=%s", resp.code, resp.msg)
+        except Exception:
+            logger.warning("获取机器人 open_id 异常", exc_info=True)
+
     def run(self, host: str | None = None, port: int | None = None) -> None:
         import uvicorn
 
@@ -811,6 +859,7 @@ class FeishuBotService:
         server = uvicorn.Server(config)
 
         async def _run_with_cleanup():
+            self._fetch_bot_open_id()
             cleanup_task = asyncio.create_task(self.start_cleanup_loop())
             try:
                 await server.serve()
