@@ -75,7 +75,7 @@ class ToolExecutionService:
                     logger.warning("获取业务 '%s' 索引信息失败", entry.name, exc_info=True)
 
         cached_keys = list(self._risk_checker._index_cache.keys())
-        logger.info(
+        logger.warning(
             "索引加载完成: %d 个表, keys=%s",
             len(cached_keys),
             [(b, c, t) for b, c, t in cached_keys],
@@ -149,7 +149,7 @@ class ToolExecutionService:
         await self.ensure_indexes_loaded()
         risk_result = self._risk_checker.check(business or "default", cluster, sql)
         if risk_result.has_risk:
-            logger.info(
+            logger.warning(
                 "静态风险检测: business=%s cluster=%s sql=%.80s → %s %s",
                 business, cluster, sql, risk_result.risk_level, risk_result.risk_reasons,
             )
