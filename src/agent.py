@@ -1116,6 +1116,10 @@ class QueryAgent:
                 await self._tool_execution.ensure_indexes_loaded_stdio(session)
 
                 async def execute_tool(name: str, args: dict, _business: str) -> tuple[str, str]:
+                    # stdio 模式：执行前检查（风险检测、用户确认）
+                    cancel_result = await self._tool_execution.pre_execute_check(name, args)
+                    if cancel_result is not None:
+                        return cancel_result, "default"
                     result = await session.call_tool(name, args)
                     return ToolExecutionService.serialize_tool_result(result), "default"
 
@@ -1285,28 +1289,35 @@ class QueryAgent:
                     metrics.overridden_rules = list(dict.fromkeys((metrics.overridden_rules or []) + overridden_rules))
                 tool_args = effective_args or tool_args
 
-                # 执行前检查（打印 SQL、性能风险检测、用户确认）
-                cancel_result = await self._tool_execution.pre_execute_check(tc.name, tool_args)
-                if cancel_result is not None:
-                    # 用户拒绝执行，补上取消的 tool result 保持消息序列一致
-                    tool_results.append(
-                        self.provider.build_tool_result_message(tc.id, cancel_result)
-                    )
-                    # 跳过后续 tool calls，统一处理
-                    for remaining_tc in (response.tool_calls or []):
-                        if remaining_tc.id != tc.id:
-                            tool_results.append(
-                                self.provider.build_tool_result_message(
-                                    remaining_tc.id,
-                                    json.dumps({"success": False, "error_message": "前置工具已取消"}, ensure_ascii=False),
+                # 确保 tool_args 中有 business（route_tool_call 内部风险检测需要用它查索引缓存）
+                if not tool_args.get("business") and current_business and current_business != "default":
+                    tool_args = dict(tool_args)
+                    tool_args["business"] = current_business
+
+                # 执行工具（route_tool_call 内部已包含风险检测和用户确认）
+                result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)
+                if not tc_business and resolved_business:
+                    tc_business = resolved_business
+
+                # 检查用户是否取消（route_tool_call 返回 USER_CANCELLED 时处理）
+                try:
+                    _rd = _json.loads(result_text) if isinstance(result_text, str) else {}
+                    if isinstance(_rd, dict) and _rd.get("error_type") == "USER_CANCELLED":
+                        tool_results.append(
+                            self.provider.build_tool_result_message(tc.id, result_text)
+                        )
+                        for remaining_tc in (response.tool_calls or []):
+                            if remaining_tc.id != tc.id:
+                                tool_results.append(
+                                    self.provider.build_tool_result_message(
+                                        remaining_tc.id,
+                                        json.dumps({"success": False, "error_message": "前置工具已取消"}, ensure_ascii=False),
+                                    )
                                 )
-                            )
-                    user_cancelled = True
-                    break
-                else:
-                    result_text, resolved_business = await execute_tool(tc.name, tool_args, tc_business)
-                    if not tc_business and resolved_business:
-                        tc_business = resolved_business
+                        user_cancelled = True
+                        break
+                except (ValueError, AttributeError):
+                    pass
 
                 logger.info("调用工具: %s(%s)", tc.name, _sanitize_args_for_log(tool_args))
 

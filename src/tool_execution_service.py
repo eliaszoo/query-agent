@@ -240,6 +240,11 @@ class ToolExecutionService:
         args_with_business = dict(arguments)
         args_with_business["business"] = business
 
+        # 执行前检查（business 已确定，索引缓存能正确命中）
+        cancel_result = await self.pre_execute_check(tool_name, args_with_business)
+        if cancel_result is not None:
+            return cancel_result
+
         try:
             return await self._registry.call_tool(business, tool_name, args_with_business)
         except Exception as e:

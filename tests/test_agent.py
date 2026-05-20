@@ -1916,10 +1916,12 @@ class TestRouteToolCallWithCurrentBusiness:
         registry.call_tool = AsyncMock(return_value='{"success": true}')
         registry.list_businesses.return_value = []
         risk_checker = MagicMock()
+        async def _confirm(**_):
+            return True
         return ToolExecutionService(
             registry=registry,
             risk_checker=risk_checker,
-            confirm_callback=lambda _: True,
+            confirm_callback=_confirm,
             is_stdio_mode=False,
             field_knowledge_manager=MagicMock(),
         )
